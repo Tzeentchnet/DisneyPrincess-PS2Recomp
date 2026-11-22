@@ -207,6 +207,13 @@ namespace ps2x::iop
         return hle->handleRpc(request);
     }
 
+    bool IopSubsystem::handleSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize)
+    {
+        return m_impl->emulator.handleSifCommand(commandId, packet, packetSize);
+    }
+
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)
     {
         for (auto &service : m_impl->coreServices)
@@ -257,6 +264,7 @@ namespace ps2x::iop
         snapshot.emulatorLoadedModules = m_impl->emulator.loadedModuleCount();
         snapshot.emulatorThreads = m_impl->emulator.threadCount();
         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
+        snapshot.threads = m_impl->emulator.debugThreads();
         snapshot.diagnostics = m_impl->loadOutcomes;
         if (!m_impl->lastError.empty())
         {

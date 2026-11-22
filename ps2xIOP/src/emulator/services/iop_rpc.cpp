@@ -7,12 +7,23 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        bool sifCommandTraceEnabled()
+        {
+            const char *value = std::getenv("PS2X_TRACE_SIF_COMMANDS");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }
+    }
+
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
         : m_host(host), m_memory(memory), m_kernel(kernel)
     {
@@ -21,11 +32,19 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_commandHandlers.clear();
+        m_userCommandBuffer = 0u;
+        m_userCommandCount = 0u;
+        m_systemCommandBuffer = 0u;
+        m_systemCommandCount = 0u;
+        std::fill(std::begin(m_sregs), std::end(m_sregs), 0u);
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
 
-    bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+    bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal,
+                                            IopCpuState &cpu,
+                                            IopGuestExecutor &executor)
     {
         const auto setV0 = [&](uint32_t value)
         {
@@ -38,7 +57,8 @@ namespace ps2x::iop::detail
             m_sifInitialized = true;
             setV0(0u);
             return true;
-        case 7: // sceSifSetDma
+        case 7:  // sceSifSetDma
+        case 32: // sceSifSetDmaIntr
         {
             constexpr uint32_t kDescriptorSize = 16u;
             constexpr uint32_t kMaxDescriptors = 32u;
@@ -116,6 +136,17 @@ namespace ps2x::iop::detail
             {
                 m_nextDmaId = 1u;
             }
+            if (ordinal == 32u && cpu.gpr[6] != 0u)
+            {
+                executor.scheduleGuestFunction(cpu.gpr[6],
+                                               cpu.gpr[7],
+                                               0u,
+                                               0u,
+                                               0u,
+                                               cpu.gpr[28],
+                                               1u,
+                                               100000u);
+            }
             setV0(dmaId);
             return true;
         }
@@ -140,17 +171,101 @@ namespace ps2x::iop::detail
         switch (ordinal)
         {
         case 4: // InitCmd
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
+            setV0(0u);
+            return true;
+        case 5: // ExitCmd
+            m_commandHandlers.clear();
+            m_userCommandBuffer = 0u;
+            m_userCommandCount = 0u;
+            m_systemCommandBuffer = 0u;
+            m_systemCommandCount = 0u;
+            setV0(0u);
+            return true;
+        case 6: // GetSreg
+            setV0(cpu.gpr[4] < std::size(m_sregs) ? m_sregs[cpu.gpr[4]] : 0u);
+            return true;
+        case 7: // SetSreg
+            if (cpu.gpr[4] < std::size(m_sregs))
+                m_sregs[cpu.gpr[4]] = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 8: // SetCmdBuffer
+            m_userCommandBuffer = cpu.gpr[4];
+            m_userCommandCount = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 9: // SetSysCmdBuffer
+            m_systemCommandBuffer = cpu.gpr[4];
+            m_systemCommandCount = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 10: // AddCmdHandler
+        {
+            const uint32_t commandId = cpu.gpr[4];
+            const uint32_t function = cpu.gpr[5];
+            const uint32_t argument = cpu.gpr[6];
+            const bool system = (commandId & 0x80000000u) != 0u;
+            const uint32_t index = commandId & 0x7FFFFFFFu;
+            const uint32_t table = system ? m_systemCommandBuffer : m_userCommandBuffer;
+            const uint32_t count = system ? m_systemCommandCount : m_userCommandCount;
+            const uint32_t stride = system ? 12u : 8u;
+
+            if (function == 0u)
+                m_commandHandlers.erase(commandId);
+            else
+                m_commandHandlers[commandId] = CommandHandler{function, argument, cpu.gpr[28]};
+
+            if (table != 0u && index < count &&
+                m_memory.ownsRamRange(table + index * stride, 8u))
+            {
+                m_memory.write32(table + index * stride, function);
+                m_memory.write32(table + index * stride + 4u, argument);
+            }
+            if (sifCommandTraceEnabled())
+            {
+                std::ostringstream message;
+                message << "[IOP SIF] "
+                        << (function == 0u ? "cleared" : "registered")
+                        << " handler cid=0x" << std::hex << commandId
+                        << " function=0x" << function
+                        << " argument=0x" << argument
+                        << " gp=0x" << cpu.gpr[28]
+                        << " table=0x" << table
+                        << std::dec << " count=" << count;
+                m_host.log(LogLevel::Debug, message.str());
+            }
+            setV0(0u);
+            return true;
+        }
+        case 11: // RemoveCmdHandler
+        {
+            const uint32_t commandId = cpu.gpr[4];
+            const bool system = (commandId & 0x80000000u) != 0u;
+            const uint32_t index = commandId & 0x7FFFFFFFu;
+            const uint32_t table = system ? m_systemCommandBuffer : m_userCommandBuffer;
+            const uint32_t count = system ? m_systemCommandCount : m_userCommandCount;
+            const uint32_t stride = system ? 12u : 8u;
+            m_commandHandlers.erase(commandId);
+            if (table != 0u && index < count &&
+                m_memory.ownsRamRange(table + index * stride, 8u))
+            {
+                m_memory.write32(table + index * stride, 0u);
+                m_memory.write32(table + index * stride + 4u, 0u);
+            }
+            if (sifCommandTraceEnabled())
+            {
+                std::ostringstream message;
+                message << "[IOP SIF] removed handler cid=0x"
+                        << std::hex << commandId;
+                m_host.log(LogLevel::Debug, message.str());
+            }
+            setV0(0u);
+            return true;
+        }
         case 14: // InitRpc
         case 15:
         case 16:
-            setV0(0);
+            setV0(0u);
             return true;
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
@@ -197,9 +312,20 @@ namespace ps2x::iop::detail
             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
 
-            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
+            const bool delivered =
+                m_host.sendSifCommand(commandId, packet.data(), packetSize);
+            if (sifCommandTraceEnabled())
             {
-                // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+                std::ostringstream message;
+                message << "[IOP SIF] sent command to EE cid=0x"
+                        << std::hex << commandId
+                        << " packet=0x" << packetAddress
+                        << " packetSize=0x" << packetSize
+                        << " extraSource=0x" << extraSource
+                        << " extraDestination=0x" << extraDestination
+                        << " extraSize=0x" << extraSize
+                        << " delivered=" << (delivered ? 1 : 0);
+                m_host.log(LogLevel::Debug, message.str());
             }
 
             const uint32_t dmaId = m_nextDmaId++;
@@ -220,6 +346,7 @@ namespace ps2x::iop::detail
             server.callback = m_memory.read32(stackPointer + 16u);
             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
             server.queue = m_memory.read32(stackPointer + 24u);
+            server.priority = m_kernel.currentThreadPriority();
             m_servers[server.sid] = server;
             if (server.serverData != 0u)
             {
@@ -273,6 +400,56 @@ namespace ps2x::iop::detail
         }
     }
 
+    bool IopRpcBridge::handleSifCommand(uint32_t commandId,
+                                        const void *packet,
+                                        size_t packetSize,
+                                        IopGuestExecutor &executor)
+    {
+        constexpr size_t kHeaderSize = 16u;
+        constexpr size_t kMaxPacketSize = 112u;
+        if (!packet || packetSize < kHeaderSize || packetSize > kMaxPacketSize)
+            return false;
+
+        const auto handler = m_commandHandlers.find(commandId);
+        if (handler == m_commandHandlers.end() || handler->second.function == 0u)
+            return false;
+        const CommandHandler registered = handler->second;
+
+        const uint32_t packetAddress =
+            m_memory.allocate(static_cast<uint32_t>(packetSize), 16u);
+        if (packetAddress == 0u)
+            return false;
+        if (!m_memory.writeRam(packetAddress, packet, packetSize))
+        {
+            static_cast<void>(m_memory.freeAllocation(packetAddress));
+            return false;
+        }
+
+        const uint32_t result =
+            executor.executeGuestFunctionWithBudget(registered.function,
+                                                    packetAddress,
+                                                    registered.argument,
+                                                    0u,
+                                                    0u,
+                                                    registered.gp,
+                                                    100000u);
+        const bool freed = m_memory.freeAllocation(packetAddress);
+        if (sifCommandTraceEnabled())
+        {
+            std::ostringstream message;
+            message << "[IOP SIF] received command from EE cid=0x"
+                    << std::hex << commandId
+                    << " handler=0x" << registered.function
+                    << " argument=0x" << registered.argument
+                    << " gp=0x" << registered.gp
+                    << " packetSize=0x" << packetSize
+                    << " result=0x" << result
+                    << " packetFreed=" << (freed ? 1 : 0);
+            m_host.log(LogLevel::Debug, message.str());
+        }
+        return freed;
+    }
+
     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
     {
         RpcResult result{};
@@ -292,12 +469,15 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        uint32_t returnPointer = executor.executeGuestFunctionOnThread(
+            server.function,
+            request.function,
+            server.buffer,
+            request.send.size,
+            0u,
+            server.gp,
+            server.priority,
+            2'000'000u);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

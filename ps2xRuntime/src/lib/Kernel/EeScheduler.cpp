@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_cop0Count = mainContext.cop0_count;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -192,6 +193,7 @@ void EeScheduler::run()
                 {
                     SET_GPR_U32(&invocation.context, 29, invocationStackTop());
                 }
+                invocation.context.cop0_count = m_cop0Count;
                 owner->invocations.push_back(std::move(invocation));
             }
         }
@@ -262,6 +264,7 @@ void EeScheduler::run()
             {
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
             }
+            invocation.context.cop0_count = m_cop0Count;
             running->invocations.push_back(std::move(invocation));
             continue;
         }
@@ -391,6 +394,20 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+    if (const R5900Context *context = currentContext())
+    {
+        m_cop0Count = context->cop0_count;
+    }
+    m_cop0Count += static_cast<uint32_t>(elapsed);
+    for (auto &[id, thread] : m_threads)
+    {
+        (void)id;
+        thread.context.cop0_count = m_cop0Count;
+        for (GuestInvocation &invocation : thread.invocations)
+        {
+            invocation.context.cop0_count = m_cop0Count;
+        }
+    }
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
@@ -1101,6 +1118,7 @@ int EeScheduler::cancelAlarm(int id)
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
+    invocation.context.cop0_count = m_cop0Count;
     invocation.sequence = ++m_invocationSequence;
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
@@ -1115,6 +1133,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     {
         SET_GPR_U32(&invocation.context, 29, invocationStackTop());
     }
+    invocation.context.cop0_count = m_cop0Count;
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
@@ -1133,6 +1152,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         {
             SET_GPR_U32(&it->context, 29, invocationStackTop());
         }
+        it->context.cop0_count = m_cop0Count;
         it->sequence = ++m_invocationSequence;
         owner->invocations.push_back(std::move(*it));
     }

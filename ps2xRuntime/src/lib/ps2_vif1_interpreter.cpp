@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -29,6 +31,16 @@ enum VIFCmd : uint8_t
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    bool traceVif1Qword(uint32_t qword)
+    {
+        const char *const value = std::getenv("PS2X_TRACE_VIF1_QWORD");
+        if (!value || *value == '\0')
+            return false;
+        char *end = nullptr;
+        const unsigned long target = std::strtoul(value, &end, 0);
+        return end != value && *end == '\0' && qword == target;
+    }
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -304,33 +316,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
-        {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
-            {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
-            continue;
-        }
-
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -498,13 +483,50 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                uint32_t chunkPos = pos;
+                uint32_t remainingQw = qwCount;
 
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
+                if (m_vif1PendingPath2ImageQwc != 0u)
                 {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
+                    const uint32_t chunkQw =
+                        std::min<uint32_t>(m_vif1PendingPath2ImageQwc,
+                                           remainingQw);
+                    std::vector<uint8_t> imagePacket(
+                        16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+                    const uint64_t imageTag =
+                        static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+                        ((m_vif1PendingPath2ImageQwc == chunkQw)
+                             ? (1ull << 15)
+                             : 0ull) |
+                        (static_cast<uint64_t>(kGifFmtImage) << 58);
+                    std::memcpy(imagePacket.data(), &imageTag,
+                                sizeof(imageTag));
+                    std::memcpy(imagePacket.data() + 16u, data + chunkPos,
+                                static_cast<size_t>(chunkQw) * 16u);
+                    submitGifPacket(GifPathId::Path2, imagePacket.data(),
+                                    static_cast<uint32_t>(imagePacket.size()),
+                                    true, m_vif1PendingPath2DirectHl);
+
+                    chunkPos += chunkQw * 16u;
+                    remainingQw -= chunkQw;
+                    m_vif1PendingPath2ImageQwc -= chunkQw;
+                    if (m_vif1PendingPath2ImageQwc == 0u)
+                        m_vif1PendingPath2DirectHl = false;
+                }
+
+                if (remainingQw > 0u)
+                {
+                    submitGifPacket(GifPathId::Path2, data + chunkPos,
+                                    remainingQw * 16u, true, directHl);
+
+                    const uint32_t pendingImageQw =
+                        pendingGifImageQwc(data + chunkPos,
+                                           remainingQw * 16u);
+                    if (pendingImageQw != 0u)
+                    {
+                        m_vif1PendingPath2ImageQwc = pendingImageQw;
+                        m_vif1PendingPath2DirectHl = directHl;
+                    }
                 }
             }
 
@@ -605,6 +627,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     bool decoded = false;
 
                     const uint8_t *srcVec = nullptr;
+                    const uint32_t sourceIndex = srcIndex;
                     if (sourceAvailable && srcIndex < sourceVectorCount)
                     {
                         srcVec = srcBase + srcIndex * bytesPerVector;
@@ -767,6 +790,34 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                    if (traceVif1Qword(destVec))
+                    {
+                        uint32_t sourceWords[4]{};
+                        if (srcVec)
+                        {
+                            const uint32_t copyBytes =
+                                bytesPerVector < sizeof(sourceWords)
+                                    ? bytesPerVector
+                                    : static_cast<uint32_t>(sizeof(sourceWords));
+                            std::memcpy(sourceWords, srcVec, copyBytes);
+                        }
+                        std::fprintf(
+                            stderr,
+                            "[VIF1 UNPACK] cmd=0x%x opcode=0x%x vn=%u vl=%u "
+                            "num=%u imm=0x%x tops=0x%x cycle=0x%x "
+                            "mode=%u mask=0x%x write=%u source=%u bytes=%u "
+                            "decoded=%u row={0x%x,0x%x,0x%x,0x%x} "
+                            "dest=0x%x src={0x%x,0x%x,0x%x,0x%x} "
+                            "out={0x%x,0x%x,0x%x,0x%x}\n",
+                            cmd, opcode, vn, vl, num, imm, vif1_regs.tops,
+                            vif1_regs.cycle, vif1_regs.mode, vif1_regs.mask,
+                            writeIndex, sourceIndex, bytesPerVector,
+                            decoded ? 1u : 0u, vif1_regs.row[0],
+                            vif1_regs.row[1], vif1_regs.row[2],
+                            vif1_regs.row[3], destVec, sourceWords[0],
+                            sourceWords[1], sourceWords[2], sourceWords[3],
+                            lanes[0], lanes[1], lanes[2], lanes[3]);
+                    }
                 }
             }
             pos += totalBytes;

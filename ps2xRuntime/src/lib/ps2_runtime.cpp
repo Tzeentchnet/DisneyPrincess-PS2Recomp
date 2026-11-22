@@ -650,6 +650,18 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
 }
 
+bool PS2Runtime::handleIopSifCommand(uint8_t *rdram,
+                                     R5900Context *ctx,
+                                     uint32_t commandId,
+                                     const void *packet,
+                                     size_t packetSize)
+{
+    if (!m_iopHost || !m_iopSubsystem)
+        return false;
+    auto scope = m_iopHost->enterCall(ctx, rdram);
+    return m_iopSubsystem->handleSifCommand(commandId, packet, packetSize);
+}
+
 bool PS2Runtime::syncCoreSubsystems()
 {
     uint8_t *const rdram = m_memory.getRDRAM();
@@ -1342,6 +1354,30 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+void PS2Runtime::setGuestBranchDebugHistoryEnabled(bool enabled)
+{
+    m_guestBranchDebugHistoryEnabled = enabled;
+    m_guestBranchDebugHistoryCursor = 0u;
+    m_guestBranchDebugHistoryCount = 0u;
+}
+
+std::vector<PS2Runtime::GuestBranchDebugEntry>
+PS2Runtime::guestBranchDebugHistory() const
+{
+    std::vector<GuestBranchDebugEntry> history;
+    history.reserve(m_guestBranchDebugHistoryCount);
+    const size_t start =
+        (m_guestBranchDebugHistoryCursor + kGuestBranchDebugHistoryCapacity -
+         m_guestBranchDebugHistoryCount) %
+        kGuestBranchDebugHistoryCapacity;
+    for (size_t index = 0u; index < m_guestBranchDebugHistoryCount; ++index)
+    {
+        history.push_back(m_guestBranchDebugHistory[
+            (start + index) % kGuestBranchDebugHistoryCapacity]);
+    }
+    return history;
+}
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1359,6 +1395,22 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
+    }
+
+    if (isCall && m_guestBranchDebugHistoryEnabled)
+    {
+        m_guestBranchDebugHistory[m_guestBranchDebugHistoryCursor] = {
+            targetPc,
+            sourcePc,
+            fallthroughPc,
+            kind,
+        };
+        m_guestBranchDebugHistoryCursor =
+            (m_guestBranchDebugHistoryCursor + 1u) %
+            kGuestBranchDebugHistoryCapacity;
+        m_guestBranchDebugHistoryCount =
+            std::min(m_guestBranchDebugHistoryCount + 1u,
+                     kGuestBranchDebugHistoryCapacity);
     }
 
     if (!isCall)

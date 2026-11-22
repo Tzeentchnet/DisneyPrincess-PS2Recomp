@@ -20,6 +20,26 @@ namespace
     {
         return static_cast<uint8_t>(1u << (3u - component));
     }
+
+    bool traceVuStore(uint32_t address)
+    {
+        const char *const value = std::getenv("PS2X_TRACE_VU_STORE_QWORD");
+        if (!value || *value == '\0')
+            return false;
+        char *end = nullptr;
+        const unsigned long qword = std::strtoul(value, &end, 0);
+        return end != value && *end == '\0' && address / 16u == qword;
+    }
+
+    bool traceVuRegister(const char *environmentName, uint32_t reg)
+    {
+        const char *const value = std::getenv(environmentName);
+        if (!value || *value == '\0')
+            return false;
+        char *end = nullptr;
+        const unsigned long target = std::strtoul(value, &end, 0);
+        return end != value && *end == '\0' && reg == target;
+    }
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -62,6 +82,20 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     : m_unit(unit)
 {
     reset();
+}
+
+VU1XgkickDebugState VU1Interpreter::xgkickDebugState() const
+{
+    return {
+        m_xgkick.sourceAddress,
+        m_xgkick.totalBytes,
+        m_xgkick.copiedBytes,
+        m_xgkick.currentTagEnd,
+        m_xgkick.cycleCredit,
+        m_xgkick.issueCycle,
+        m_xgkick.active,
+        m_xgkick.currentTagEop,
+    };
 }
 
 void VU1Interpreter::resetScheduler()
@@ -654,6 +688,24 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
 
 void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask)
 {
+    if (traceVuStore(address))
+    {
+        uint32_t lower = 0u;
+        uint32_t upper = 0u;
+        if (m_cachedVuCode && m_state.pc + 8u <= m_cachedCodeSize)
+        {
+            std::memcpy(&lower, m_cachedVuCode + m_state.pc, sizeof(lower));
+            std::memcpy(&upper, m_cachedVuCode + m_state.pc + sizeof(lower),
+                        sizeof(upper));
+        }
+        std::fprintf(stderr,
+                     "[VU1 store] cycle=%llu pc=0x%x upper=0x%x lower=0x%x "
+                     "qword=0x%x mask=0x%x "
+                     "words={0x%x,0x%x,0x%x,0x%x}\n",
+                     static_cast<unsigned long long>(m_cycle), m_state.pc,
+                     upper, lower, address / 16u, laneMask, words[0],
+                     words[1], words[2], words[3]);
+    }
     for (PendingStore &store : m_storePipeline)
     {
         if (!store.valid)
@@ -674,6 +726,33 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
 {
     if (reg == 0u || laneMask == 0u)
         return;
+    if (traceVuRegister("PS2X_TRACE_VU_VF", reg))
+    {
+        uint32_t lower = 0u;
+        uint32_t upper = 0u;
+        if (m_cachedVuCode && m_state.pc + 8u <= m_cachedCodeSize)
+        {
+            std::memcpy(&lower, m_cachedVuCode + m_state.pc, sizeof(lower));
+            std::memcpy(&upper, m_cachedVuCode + m_state.pc + sizeof(lower),
+                        sizeof(upper));
+        }
+        uint32_t words[4]{};
+        std::memcpy(words, value, sizeof(words));
+        std::fprintf(stderr,
+                     "[VU1 VF write] cycle=%llu pc=0x%x upper=0x%x lower=0x%x "
+                     "reg=%u mask=0x%x latency=%u "
+                     "words={0x%x,0x%x,0x%x,0x%x} "
+                     "vi={0x%x,0x%x,0x%x,0x%x,0x%x,0x%x,0x%x,0x%x,"
+                     "0x%x,0x%x,0x%x,0x%x,0x%x,0x%x,0x%x,0x%x}\n",
+                     static_cast<unsigned long long>(m_cycle), m_state.pc,
+                     upper, lower, reg, laneMask, latency, words[0], words[1],
+                     words[2], words[3], m_state.vi[0], m_state.vi[1],
+                     m_state.vi[2], m_state.vi[3], m_state.vi[4],
+                     m_state.vi[5], m_state.vi[6], m_state.vi[7],
+                     m_state.vi[8], m_state.vi[9], m_state.vi[10],
+                     m_state.vi[11], m_state.vi[12], m_state.vi[13],
+                     m_state.vi[14], m_state.vi[15]);
+    }
     for (PendingVfWrite &write : m_vfWritePipeline)
     {
         if (!write.valid)
@@ -700,6 +779,22 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
 {
     if (reg == 0u)
         return;
+    if (traceVuRegister("PS2X_TRACE_VU_VI", reg))
+    {
+        uint32_t lower = 0u;
+        uint32_t upper = 0u;
+        if (m_cachedVuCode && m_state.pc + 8u <= m_cachedCodeSize)
+        {
+            std::memcpy(&lower, m_cachedVuCode + m_state.pc, sizeof(lower));
+            std::memcpy(&upper, m_cachedVuCode + m_state.pc + sizeof(lower),
+                        sizeof(upper));
+        }
+        std::fprintf(stderr,
+                     "[VU1 VI write] cycle=%llu pc=0x%x upper=0x%x lower=0x%x "
+                     "reg=%u latency=%u value=0x%x\n",
+                     static_cast<unsigned long long>(m_cycle), m_state.pc,
+                     upper, lower, reg, latency, static_cast<uint32_t>(value));
+    }
     for (PendingViWrite &write : m_viWritePipeline)
     {
         if (!write.valid)

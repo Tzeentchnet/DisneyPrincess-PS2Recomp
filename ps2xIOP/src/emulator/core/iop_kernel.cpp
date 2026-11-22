@@ -4,6 +4,8 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 namespace ps2x::iop::detail
 {
@@ -15,6 +17,12 @@ namespace ps2x::iop::detail
                 return value;
             const uint32_t mask = alignment - 1u;
             return (value + mask) & ~mask;
+        }
+
+        bool semaphoreTraceEnabled()
+        {
+            const char *value = std::getenv("PS2X_TRACE_IOP_SEMAPHORES");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
         }
     }
 
@@ -369,6 +377,14 @@ namespace ps2x::iop::detail
             semaphore.current = static_cast<int>(m_memory.read32(descriptor + 8u));
             semaphore.maximum = std::max(1, static_cast<int>(m_memory.read32(descriptor + 12u)));
             m_semaphores.emplace(semaphore.id, semaphore);
+            if (semaphoreTraceEnabled())
+            {
+                std::cerr << "[IOP semaphore] create id=" << semaphore.id
+                          << " current=" << semaphore.current
+                          << " maximum=" << semaphore.maximum
+                          << " descriptor=0x" << std::hex << descriptor
+                          << std::dec << std::endl;
+            }
             setV0(semaphore.id);
             return true;
         }
@@ -388,6 +404,14 @@ namespace ps2x::iop::detail
             if (it->second.current < it->second.maximum)
                 ++it->second.current;
             wakeOneSemaphore(id);
+            if (semaphoreTraceEnabled())
+            {
+                std::cerr << "[IOP semaphore] signal id=" << id
+                          << " current=" << it->second.current
+                          << " maximum=" << it->second.maximum
+                          << " interrupt=" << (ordinal == 7 ? 1 : 0)
+                          << std::endl;
+            }
             setV0(0);
             return true;
         }
@@ -398,6 +422,11 @@ namespace ps2x::iop::detail
             const auto it = m_semaphores.find(id);
             if (it == m_semaphores.end())
             {
+                if (semaphoreTraceEnabled())
+                {
+                    std::cerr << "[IOP semaphore] wait id=" << id
+                              << " missing=1" << std::endl;
+                }
                 setV0(-1);
                 return true;
             }
@@ -406,6 +435,7 @@ namespace ps2x::iop::detail
                 --it->second.current;
                 setV0(0);
             }
+
             else if (ordinal == 9)
                 setV0(-419);
             else if (m_currentThread != nullptr)
@@ -414,6 +444,22 @@ namespace ps2x::iop::detail
                 m_currentThread->waitId = id;
                 cpu.yielded = true;
                 setV0(0);
+            }
+            else
+            {
+                setV0(-1);
+            }
+            if (semaphoreTraceEnabled())
+            {
+                std::cerr << "[IOP semaphore] wait id=" << id
+                          << " current=" << it->second.current
+                          << " maximum=" << it->second.maximum
+                          << " poll=" << (ordinal == 9 ? 1 : 0)
+                          << " thread=" << (m_currentThread != nullptr
+                                                  ? m_currentThread->id
+                                                  : 0)
+                          << " result=" << static_cast<int32_t>(cpu.gpr[2])
+                          << std::endl;
             }
             return true;
         }
@@ -669,6 +715,82 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    int IopKernel::createTransientThread(uint32_t address,
+                                         uint32_t a0,
+                                         uint32_t a1,
+                                         uint32_t a2,
+                                         uint32_t a3,
+                                         uint32_t gp,
+                                         uint32_t priority,
+                                         uint32_t stackBase,
+                                         uint32_t stackSize)
+    {
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextThreadId++);
+        thread.entry = address;
+        thread.stackBase = stackBase;
+        thread.stackSize = stackSize;
+        thread.priority = std::clamp<uint32_t>(priority, 1u, 126u);
+        thread.initialPriority = thread.priority;
+        const uint32_t physicalStackBase =
+            IopMemory::physicalAddress(stackBase);
+        if (stackSize < 0x100u || physicalStackBase > IopMemory::RamSize ||
+            stackSize > IopMemory::RamSize - physicalStackBase)
+            return -400;
+
+        thread.cpu.pc = address;
+        thread.cpu.gpr[4] = a0;
+        thread.cpu.gpr[5] = a1;
+        thread.cpu.gpr[6] = a2;
+        thread.cpu.gpr[7] = a3;
+        thread.cpu.gpr[28] = gp;
+        thread.cpu.gpr[29] =
+            alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+        thread.cpu.gpr[31] = kThreadReturnSentinel;
+        thread.state = IopThreadState::Ready;
+        thread.transient = true;
+
+        const int id = thread.id;
+        m_threads.emplace(id, std::move(thread));
+        return id;
+    }
+
+    bool IopKernel::transientThreadComplete(int id) const
+    {
+        const auto thread = m_threads.find(id);
+        return thread == m_threads.end() ||
+               thread->second.state == IopThreadState::Dormant ||
+               thread->second.state == IopThreadState::Dead;
+    }
+
+    bool IopKernel::takeTransientThreadResult(int id, uint32_t &result)
+    {
+        const auto thread = m_threads.find(id);
+        if (thread == m_threads.end() || !thread->second.transient ||
+            (thread->second.state != IopThreadState::Dormant &&
+             thread->second.state != IopThreadState::Dead))
+        {
+            return false;
+        }
+
+        result = thread->second.cpu.gpr[2];
+        m_threads.erase(thread);
+        return true;
+    }
+
+    void IopKernel::cancelTransientThread(int id)
+    {
+        const auto thread = m_threads.find(id);
+        if (thread == m_threads.end() || !thread->second.transient)
+            return;
+        m_threads.erase(thread);
+    }
+
+    uint32_t IopKernel::currentThreadPriority() const noexcept
+    {
+        return m_currentThread != nullptr ? m_currentThread->priority : 0x40u;
+    }
+
     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
     {
         for (auto &[id, thread] : m_threads)
@@ -726,6 +848,11 @@ namespace ps2x::iop::detail
                 ++thread;
                 continue;
             }
+            if (thread->second.transient)
+            {
+                ++thread;
+                continue;
+            }
             if (thread->second.stackBase != 0u)
                 (void)m_memory.freeAllocation(thread->second.stackBase);
             thread = m_threads.erase(thread);
@@ -740,5 +867,27 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+
+    std::vector<DebugThread> IopKernel::debugThreads() const
+    {
+        std::vector<DebugThread> snapshot;
+        snapshot.reserve(m_threads.size());
+        for (const auto &[id, thread] : m_threads)
+        {
+            snapshot.push_back(DebugThread{
+                id,
+                static_cast<uint32_t>(thread.state),
+                thread.priority,
+                thread.cpu.pc,
+                thread.cpu.gpr[31],
+                thread.cpu.gpr[29],
+                thread.entry,
+                thread.waitId,
+                thread.waitBits,
+                thread.wakeCycle,
+            });
+        }
+        return snapshot;
     }
 }

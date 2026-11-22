@@ -300,6 +300,11 @@ public:
     bool writeIopMemory(uint32_t address, const void *source, size_t size);
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;
+    bool handleIopSifCommand(uint8_t *rdram,
+                             R5900Context *ctx,
+                             uint32_t commandId,
+                             const void *packet,
+                             size_t packetSize);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -316,6 +321,14 @@ public:
         IndirectJump,
         IndirectCall,
         Return,
+    };
+
+    struct GuestBranchDebugEntry
+    {
+        uint32_t targetPc = 0;
+        uint32_t sourcePc = 0;
+        uint32_t fallthroughPc = 0;
+        GuestBranchKind kind = GuestBranchKind::DirectCall;
     };
 
     enum class MissingFunctionPolicy : uint32_t
@@ -338,6 +351,8 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+    void setGuestBranchDebugHistoryEnabled(bool enabled);
+    std::vector<GuestBranchDebugEntry> guestBranchDebugHistory() const;
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -524,6 +539,12 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    static constexpr size_t kGuestBranchDebugHistoryCapacity = 2048u;
+    std::array<GuestBranchDebugEntry, kGuestBranchDebugHistoryCapacity>
+        m_guestBranchDebugHistory{};
+    size_t m_guestBranchDebugHistoryCursor = 0u;
+    size_t m_guestBranchDebugHistoryCount = 0u;
+    bool m_guestBranchDebugHistoryEnabled = false;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};

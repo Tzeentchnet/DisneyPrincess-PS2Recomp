@@ -1,6 +1,7 @@
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -258,6 +259,234 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
         std::memcpy(host.guest.data() + address + codeOffset + importTableOffset,
                     importTable, sizeof(importTable));
+    }
+
+    void writeBlockingRpcServerIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t rpcSid = 0xB10C0001u;
+        constexpr uint32_t registerRpcStub = 0x00010614u;
+        constexpr uint32_t createSemaStub = 0x00010654u;
+        constexpr uint32_t signalSemaStub = 0x0001065Cu;
+        constexpr uint32_t waitSemaStub = 0x00010664u;
+        constexpr uint32_t createThreadStub = 0x00010694u;
+        constexpr uint32_t startThreadStub = 0x0001069Cu;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t entry[] = {
+            0x27BDFFE0u, 0xAFBF001Cu,
+            0x3C040001u, 0x34840500u,
+            0x0C000000u | ((createSemaStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x3C080001u, 0xAD020510u,
+            0x3C040001u, 0x34840520u,
+            0x0C000000u | ((createThreadStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x00402021u,
+            0x0C000000u | ((startThreadStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x3C040001u, 0x34840200u,
+            0x3C050000u | ((rpcSid >> 16u) & 0xFFFFu),
+            0x34A50000u | (rpcSid & 0xFFFFu),
+            0x3C060001u, 0x34C60300u,
+            0x3C070001u, 0x34E70400u,
+            0xAFA00010u, 0xAFA00014u, 0xAFA00018u,
+            0x0C000000u | ((registerRpcStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x8FBF001Cu, 0x00001021u, 0x27BD0020u,
+            0x03E00008u, 0u,
+        };
+        const uint32_t handler[] = {
+            0x27BDFFE0u, 0xAFBF001Cu, 0xAFB00018u,
+            0x3C101357u, 0x36109BDFu, 0xAFB00010u,
+            0x3C080001u, 0x8D040510u,
+            0x0C000000u | ((waitSemaStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x3C080001u, 0x35080400u,
+            0x8FA90010u, 0u, 0xAD090000u, 0xAD020004u,
+            0x01001021u,
+            0x8FB00018u, 0x8FBF001Cu, 0x27BD0020u,
+            0x03E00008u, 0u,
+        };
+        const uint32_t signaler[] = {
+            0x27BDFFE8u, 0xAFBF0014u,
+            0x3C080001u, 0x8D040510u,
+            0x0C000000u | ((signalSemaStub >> 2u) & 0x03FFFFFFu), 0u,
+            0x8FBF0014u, 0x27BD0018u,
+            0x03E00008u, 0u,
+        };
+        const uint32_t sifcmdImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x63666973u, 0x0000646Du,
+            0x03E00008u, 0x24000011u,
+            0u,
+        };
+        const uint32_t thsemapImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x65736874u, 0x0070616Du,
+            0x03E00008u, 0x24000004u,
+            0x03E00008u, 0x24000006u,
+            0x03E00008u, 0x24000008u,
+            0u, 0u,
+        };
+        const uint32_t thbaseImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x61626874u, 0x00006573u,
+            0x03E00008u, 0x24000004u,
+            0x03E00008u, 0x24000006u,
+            0u, 0u,
+        };
+        const uint32_t semaphoreDescriptor[] = {
+            0u, 0u, 0u, 1u,
+        };
+        const uint32_t threadDescriptor[] = {
+            0u, 0u, 0x00010380u, 0x400u, 100u,
+        };
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = 0x6C0u;
+        program.memsz = 0x800u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        const auto put = [&](uint32_t offset, const void *data, size_t size)
+        {
+            std::memcpy(segment.data() + offset, data, size);
+        };
+        put(0u, entry, sizeof(entry));
+        put(0x300u, handler, sizeof(handler));
+        put(0x380u, signaler, sizeof(signaler));
+        put(0x500u, semaphoreDescriptor, sizeof(semaphoreDescriptor));
+        put(0x520u, threadDescriptor, sizeof(threadDescriptor));
+        put(0x600u, sifcmdImports, sizeof(sifcmdImports));
+        put(0x640u, thsemapImports, sizeof(thsemapImports));
+        put(0x680u, thbaseImports, sizeof(thbaseImports));
+
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program,
+                    sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(),
+                    segment.size());
+    }
+
+    void writeSifCommandIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t handlerAddress = loadAddress + 0x100u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x200u;
+        constexpr uint32_t setBufferStub = importTableAddress + 20u;
+        constexpr uint32_t addHandlerStub = setBufferStub + 8u;
+        constexpr uint32_t removeHandlerStub = addHandlerStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t entry[] = {
+            0x27BDFFE0u, // addiu sp, sp, -0x20
+            0xAFBF001Cu, // sw    ra, 0x1c(sp)
+            0x3C040001u, // lui   a0, 1
+            0x34840300u, // ori   a0, a0, 0x300 (command table)
+            0x24050004u, // addiu a1, zero, 4
+            0x0C000000u | ((setBufferStub >> 2u) & 0x03FFFFFFu),
+            0x00000000u, // nop
+            0x00002021u, // addu  a0, zero, zero (command id)
+            0x3C050001u, // lui   a1, 1
+            0x34A50100u, // ori   a1, a1, 0x100 (handler)
+            0x24061234u, // addiu a2, zero, 0x1234 (handler argument)
+            0x0C000000u | ((addHandlerStub >> 2u) & 0x03FFFFFFu),
+            0x00000000u, // nop
+            0x8FBF001Cu, // lw    ra, 0x1c(sp)
+            0x00001021u, // addu  v0, zero, zero
+            0x27BD0020u, // addiu sp, sp, 0x20
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        const uint32_t handler[] = {
+            0x27BDFFE0u, // addiu sp, sp, -0x20
+            0xAFBF001Cu, // sw    ra, 0x1c(sp)
+            0x8C880000u, // lw    t0, 0(a0)
+            0x8C890008u, // lw    t1, 8(a0)
+            0x8C8A000Cu, // lw    t2, 12(a0)
+            0x3C0B0001u, // lui   t3, 1
+            0x356B0400u, // ori   t3, t3, 0x400 (result buffer)
+            0xAD680000u, // sw    t0, 0(t3)
+            0xAD690004u, // sw    t1, 4(t3)
+            0xAD6A0008u, // sw    t2, 8(t3)
+            0xAD65000Cu, // sw    a1, 12(t3)
+            0x00002021u, // addu  a0, zero, zero (command id)
+            0x0C000000u | ((removeHandlerStub >> 2u) & 0x03FFFFFFu),
+            0x00000000u, // nop
+            0x8FBF001Cu, // lw    ra, 0x1c(sp)
+            0x27BD0020u, // addiu sp, sp, 0x20
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        const uint32_t imports[] = {
+            0x41E00000u,
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u,
+            0x24000008u, // sceSifSetCmdBuffer
+            0x03E00008u,
+            0x2400000Au, // sceSifAddCmdHandler
+            0x03E00008u,
+            0x2400000Bu, // sceSifRemoveCmdHandler
+            0x00000000u,
+        };
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = 0x240u;
+        program.memsz = 0x500u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + (handlerAddress - loadAddress), handler, sizeof(handler));
+        std::memcpy(segment.data() + (importTableAddress - loadAddress), imports, sizeof(imports));
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
     void writeRelocatableRpcServerIrx(TestHost &host, uint32_t address)
@@ -615,6 +844,66 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    void writeSifDmaIntrIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t callbackAddress = loadAddress + 0x80u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x100u;
+        constexpr uint32_t setDmaIntrStub = importTableAddress + 20u;
+        constexpr uint32_t descriptorAddress = loadAddress + 0x180u;
+        constexpr uint32_t payloadAddress = loadAddress + 0x1A0u;
+        constexpr uint32_t eeDestination = 0xC04u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x200u; program.memsz = 0x200u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            0x3C040001u, 0x34840180u, // a0 = descriptor
+            0x24050001u,             // a1 = descriptor count
+            0x3C060001u, 0x34C60080u, // a2 = callback
+            0x24071234u,             // a3 = callback argument
+            jal(setDmaIntrStub), 0x00000000u,
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t callback[] = {
+            0x3C080001u, 0x350801B0u,
+            0xAD040000u,
+            0x03E00008u, 0x00001021u,
+        };
+        const uint32_t imports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x6D666973u, 0x00006E61u, // "sifman"
+            0x03E00008u, 0x24000020u, // sceSifSetDmaIntr
+            0u, 0u,
+        };
+        const uint32_t descriptor[] = {
+            payloadAddress, eeDestination, sizeof(uint32_t), 0u,
+        };
+        constexpr uint32_t payload = 0x494E5452u; // "INTR"
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x80u, callback, sizeof(callback));
+        std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
+        std::memcpy(segment.data() + 0x180u, descriptor, sizeof(descriptor));
+        std::memcpy(segment.data() + 0x1A0u, &payload, sizeof(payload));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     void writeMcmanRegistrationIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -925,6 +1214,77 @@ int main()
     if (!expect(!iop.canBindRpc(rpcSid),
                 "IOP reset did not remove the registered RPC server")) return 1;
 
+    constexpr uint32_t blockingRpcSid = 0xB10C0001u;
+    writeBlockingRpcServerIrx(host, 0x100u);
+    const ModuleLoadResult blockingRpcModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(blockingRpcModule.handled &&
+                    blockingRpcModule.startResult == 0,
+                "Blocking RPC server IRX did not start")) return 1;
+    RpcRequest blockingRequest{};
+    blockingRequest.sid = blockingRpcSid;
+    blockingRequest.receive = {0x800u, 2u * sizeof(uint32_t)};
+    const RpcResult blockingResult = iop.handleRpc(blockingRequest);
+    std::array<uint32_t, 2> blockingResponse{};
+    std::array<uint32_t, 2> blockingIopResponse{};
+    std::memcpy(blockingResponse.data(), host.guest.data() + 0x800u,
+                sizeof(blockingResponse));
+    (void)iop.readMemory(0x00010400u, blockingIopResponse.data(),
+                         sizeof(blockingIopResponse));
+    if (!blockingResult.handled ||
+        blockingResponse[0] != 0x13579BDFu ||
+        blockingResponse[1] != 0u)
+    {
+        std::cerr << "Blocking RPC response: handled="
+                  << (blockingResult.handled ? 1 : 0)
+                  << " words={0x" << std::hex << blockingResponse[0]
+                  << ",0x" << blockingResponse[1] << "}"
+                  << " iop={0x" << blockingIopResponse[0]
+                  << ",0x" << blockingIopResponse[1] << "}"
+                  << std::dec << '\n';
+        for (const std::string &log : host.logs)
+            std::cerr << log << '\n';
+    }
+    if (!expect(blockingResult.handled &&
+                    blockingResponse[0] == 0x13579BDFu &&
+                    blockingResponse[1] == 0u,
+                "RPC handler did not resume with intact state after WaitSema")) return 1;
+
+    iop.reset();
+    writeSifCommandIrx(host, 0x100u);
+    const ModuleLoadResult commandModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(commandModule.handled && commandModule.startResult == 0,
+                "Synthetic SIF command IRX did not start")) return 1;
+    const std::array<uint32_t, 7> commandPacket{
+        0x0000181Cu,
+        0x00138700u,
+        0u,
+        0xABCDEF01u,
+        0x11223344u,
+        0x55667788u,
+        0x99AABBCCu,
+    };
+    if (!expect(iop.handleSifCommand(
+                    0u, commandPacket.data(), sizeof(commandPacket)),
+                "Registered IOP SIF command handler was not dispatched")) return 1;
+    std::array<uint32_t, 4> commandResult{};
+    if (!expect(iop.readMemory(
+                    0x00010400u, commandResult.data(), sizeof(commandResult)),
+                "Could not read SIF command handler result")) return 1;
+    if (!expect(commandResult[0] == commandPacket[0] &&
+                    commandResult[1] == commandPacket[2] &&
+                    commandResult[2] == commandPacket[3] &&
+                    commandResult[3] == 0x1234u,
+                "SIF command packet or handler argument was corrupted")) return 1;
+    if (!expect(!iop.handleSifCommand(
+                    0u, commandPacket.data(), sizeof(commandPacket)),
+                "Removed SIF command handler was still dispatched")) return 1;
+    std::array<uint32_t, 2> commandTable{};
+    if (!expect(iop.readMemory(
+                    0x00010300u, commandTable.data(), sizeof(commandTable)) &&
+                    commandTable[0] == 0u && commandTable[1] == 0u,
+                "sceSifRemoveCmdHandler did not clear the command table")) return 1;
+
+    iop.reset();
     constexpr uint32_t lotrSoundSid = 0x00012345u;
     writeRpcServerIrx(host, 0x100u, lotrSoundSid);
     const ModuleLoadResult physicalSoundModule = iop.loadModuleBuffer(0x100u);
@@ -1031,6 +1391,29 @@ int main()
                 "sceSifDmaStat did not report the synchronous transfer as complete")) return 1;
     if (!expect(sifDmaPayload == 0x53494621u,
                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
+
+    iop.reset();
+    writeSifDmaIntrIrx(host, 0x100u);
+    const ModuleLoadResult sifDmaIntrModule = iop.loadModuleBuffer(0x100u);
+    uint32_t sifDmaIntrPayload = 0u;
+    std::memcpy(&sifDmaIntrPayload, host.guest.data() + 0xC04u,
+                sizeof(sifDmaIntrPayload));
+    uint32_t sifDmaIntrArgument = 0u;
+    if (!expect(iop.readMemory(
+                    0x000101B0u, &sifDmaIntrArgument, sizeof(sifDmaIntrArgument)),
+                "Could not read sceSifSetDmaIntr callback marker")) return 1;
+    if (!expect(sifDmaIntrModule.handled && sifDmaIntrModule.startResult > 0,
+                "sceSifSetDmaIntr did not return a transfer id")) return 1;
+    if (!expect(sifDmaIntrPayload == 0x494E5452u,
+                "sceSifSetDmaIntr did not copy the payload into EE memory")) return 1;
+    if (!expect(sifDmaIntrArgument == 0u,
+                "sceSifSetDmaIntr invoked its completion callback inline")) return 1;
+    iop.runEeCycles(8u * 4096u);
+    if (!expect(iop.readMemory(
+                    0x000101B0u, &sifDmaIntrArgument, sizeof(sifDmaIntrArgument)),
+                "Could not reread sceSifSetDmaIntr callback marker")) return 1;
+    if (!expect(sifDmaIntrArgument == 0x1234u,
+                "sceSifSetDmaIntr did not invoke its completion callback")) return 1;
 
     iop.reset();
     writeVblankSchedulingIrx(host, 0x100u);

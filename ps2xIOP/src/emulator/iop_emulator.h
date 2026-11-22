@@ -26,6 +26,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+        [[nodiscard]] bool handleSifCommand(uint32_t commandId,
+                                            const void *packet,
+                                            size_t packetSize);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
 
@@ -41,6 +44,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+        [[nodiscard]] std::vector<DebugThread> debugThreads() const;
 
     private:
         class Impl;

@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
@@ -1346,7 +1347,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1402,13 +1403,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     const bool isVifChannel =
                         channelBase == 0x10009000u || channelBase == 0x10008000u;
-                    const bool transferTagData = isVifChannel && (chcr & 0x40u) != 0u;
 
                     int tagsProcessed = 0;
+                    bool chainTagCapHit = false;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-                    while (tagsProcessed < kMaxChainTags)
+                    while (true)
                     {
+                        if (tagsProcessed >= kMaxChainTags)
+                        {
+                            chainTagCapHit = true;
+                            break;
+                        }
                         const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
                         uint32_t physTag = 0;
@@ -1512,7 +1518,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
-                        if (transferTagData)
+                        if (isVifChannel)
                             appendVifTagData(currentTagAddr);
 
                         if (hasPayload)
@@ -1521,6 +1527,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             endChain = true;
                         if (endChain)
                             break;
+                    }
+
+                    if (chainTagCapHit)
+                    {
+                        static bool s_vifChainTagCapWarned = false;
+                        if (!s_vifChainTagCapWarned)
+                        {
+                            s_vifChainTagCapWarned = true;
+                            std::cerr
+                                << "PS2Memory: DMA chain walker hit the "
+                                << kMaxChainTags
+                                << "-tag cap; truncating a possible loop."
+                                << std::endl;
+                        }
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;

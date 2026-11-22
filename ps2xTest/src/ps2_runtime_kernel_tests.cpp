@@ -668,6 +668,36 @@ void register_ps2_runtime_kernel_tests()
                       "the scheduler must publish guest execution only around the active guest call");
         });
 
+        tc.Run("EE scheduler advances the global COP0 Count", [](TestCase &t)
+        {
+            TestEnv env;
+            env.ctx.cop0_count = 0xFFFFFFF0u;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            ee.accountCycles(0x20u);
+            t.Equals(ee.currentContext()->cop0_count, 0x10u,
+                     "COP0 Count should advance with EE cycles and wrap at 32 bits");
+
+            ee.currentContext()->cop0_count = 0x12345678u;
+            ee.accountCycles(8u);
+            t.Equals(ee.currentContext()->cop0_count, 0x12345680u,
+                     "an MTC0-style Count write should establish the new global counter value");
+
+            try
+            {
+                ee.sleepCurrent();
+            }
+            catch (const EeDispatcherTransfer &)
+            {
+            }
+            ee.accountCycles(0x20u);
+            t.Equals(ee.thread(EeScheduler::kMainThreadId)->context.cop0_count,
+                     0x123456A0u,
+                     "COP0 Count should continue advancing while the owning thread waits");
+        });
+
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;

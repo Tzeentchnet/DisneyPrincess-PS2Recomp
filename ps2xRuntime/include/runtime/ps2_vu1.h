@@ -35,6 +35,18 @@ struct VU1State
     uint32_t branchDelay;
 };
 
+struct VU1XgkickDebugState
+{
+    uint32_t sourceAddress = 0;
+    uint32_t totalBytes = 0;
+    uint32_t copiedBytes = 0;
+    uint32_t currentTagEnd = 0;
+    uint32_t cycleCredit = 0;
+    uint64_t issueCycle = 0;
+    bool active = false;
+    bool currentTagEop = false;
+};
+
 class VU1Interpreter
 {
 public:
@@ -61,6 +73,7 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+    [[nodiscard]] VU1XgkickDebugState xgkickDebugState() const;
 
 private:
     enum Pipeline : uint8_t

@@ -1,10 +1,12 @@
 #pragma once
 
 #include "iop_cpu.h"
+#include "ps2x/iop/iop_types.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -41,6 +43,7 @@ namespace ps2x::iop::detail
         uint32_t waitMode = 0;
         uint32_t waitResultAddress = 0;
         int wakeupCount = 0;
+        bool transient = false;
     };
 
     class IopKernel
@@ -60,6 +63,20 @@ namespace ps2x::iop::detail
         void sleepCurrent(IopCpuState &cpu);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
+        [[nodiscard]] int createTransientThread(uint32_t address,
+                                                uint32_t a0,
+                                                uint32_t a1,
+                                                uint32_t a2,
+                                                uint32_t a3,
+                                                uint32_t gp,
+                                                uint32_t priority,
+                                                uint32_t stackBase,
+                                                uint32_t stackSize);
+        [[nodiscard]] bool transientThreadComplete(int id) const;
+        [[nodiscard]] bool takeTransientThreadResult(int id, uint32_t &result);
+        void cancelTransientThread(int id);
+        [[nodiscard]] uint32_t currentThreadPriority() const noexcept;
+
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
@@ -67,6 +84,7 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        [[nodiscard]] std::vector<DebugThread> debugThreads() const;
 
     private:
         struct Semaphore

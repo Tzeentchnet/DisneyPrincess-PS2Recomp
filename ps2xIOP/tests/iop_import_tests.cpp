@@ -4,6 +4,7 @@
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
 #include "emulator/imports/iop_loadcore.h"
+#include "emulator/imports/iop_stdio.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace
 {
@@ -46,7 +48,9 @@ namespace
         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
         bool hasGuestFunction(uint32_t) const override { return false; }
         bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
-        void log(LogLevel, std::string_view) override {}
+        void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+
+        std::vector<std::string> logs;
     };
 
     class CdRootHost final : public NullHost
@@ -326,12 +330,71 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    bool testStdioPrintfFormatting()
+    {
+        NullHost host;
+        IopMemory memory;
+        IopStdio stdio(host, memory);
+
+        constexpr uint32_t formatAddress = 0x2000u;
+        constexpr uint32_t stringAddress = 0x2100u;
+        constexpr uint32_t stackAddress = 0x2200u;
+        constexpr char format[] = "error %d -> %u, %08x, %s, %u";
+        constexpr char text[] = "ready";
+        (void)memory.writeRam(formatAddress, format, sizeof(format));
+        (void)memory.writeRam(stringAddress, text, sizeof(text));
+        memory.write32(stackAddress + 16u, stringAddress);
+        memory.write32(stackAddress + 20u, 55u);
+
+        IopCpuState cpu{};
+        cpu.gpr[4] = formatAddress;
+        cpu.gpr[5] = static_cast<uint32_t>(-7);
+        cpu.gpr[6] = 12u;
+        cpu.gpr[7] = 0xABCDu;
+        cpu.gpr[29] = stackAddress;
+
+        constexpr std::string_view expected =
+            "[IOP printf] error -7 -> 12, 0000abcd, ready, 55";
+        return expect(stdio.dispatchImport(4u, cpu), "stdio:4 was not handled") &&
+               expect(host.logs.size() == 1u, "printf did not emit exactly one log") &&
+               expect(host.logs.front() == expected, "printf did not format guest varargs") &&
+               expect(cpu.gpr[2] == expected.size() - std::string_view("[IOP printf] ").size(),
+                      "printf returned the wrong formatted length");
+    }
+
+    bool testDetachedSemaphoreWaitFailsExplicitly()
+    {
+        IopMemory memory;
+        IopKernel kernel(memory);
+        kernel.reset();
+
+        constexpr uint32_t descriptor = 0x2300u;
+        memory.write32(descriptor + 8u, 0u);
+        memory.write32(descriptor + 12u, 1u);
+
+        IopCpuState cpu{};
+        cpu.gpr[4] = descriptor;
+        if (!expect(kernel.dispatchSemaphoreImport(4u, cpu),
+                    "CreateSema was not handled"))
+            return false;
+        const uint32_t semaphoreId = cpu.gpr[2];
+
+        cpu = {};
+        cpu.gpr[2] = 0x60000u;
+        cpu.gpr[4] = semaphoreId;
+        return expect(kernel.dispatchSemaphoreImport(8u, cpu),
+                      "WaitSema was not handled") &&
+               expect(cpu.gpr[2] == 0xFFFFFFFFu,
+                      "detached WaitSema preserved a stale return value");
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testTimrmanPeriodicCallback() || !testStdioPrintfFormatting() ||
+        !testDetachedSemaphoreWaitFailsExplicitly())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

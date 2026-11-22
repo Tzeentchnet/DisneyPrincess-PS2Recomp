@@ -90,7 +90,11 @@ namespace ps2x::iop::detail
         {
             uint32_t function = 0u;
             uint32_t gp = 0u;
-            uint32_t argument = 0u;
+            uint32_t a0 = 0u;
+            uint32_t a1 = 0u;
+            uint32_t a2 = 0u;
+            uint32_t a3 = 0u;
+            uint32_t instructionBudget = 100000u;
         };
 
         explicit Impl(IopHost &hostRef)
@@ -255,9 +259,9 @@ namespace ps2x::iop::detail
                     pendingGuestCallbacks.emplace(
                         totalCycles + kCdvdCompletionCycles,
                         ScheduledGuestCallback{
-                            callback->address,
-                            callback->gp,
-                            callback->reason,
+                            .function = callback->address,
+                            .gp = callback->gp,
+                            .a0 = callback->reason,
                         });
                 }
                 return ImportDisposition::Handled;
@@ -318,7 +322,7 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
+                return rpc.dispatchSifManImport(call.ordinal, cpu, *this)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
@@ -408,7 +412,9 @@ namespace ps2x::iop::detail
                     break;
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
-                if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+                if (callDepth == 0u &&
+                    !servicingGuestCallbacks &&
+                    !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
             }
             activeCpu = previous;
@@ -480,6 +486,88 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
         }
 
+        uint32_t executeGuestFunctionOnThread(uint32_t address,
+                                              uint32_t a0,
+                                              uint32_t a1,
+                                              uint32_t a2,
+                                              uint32_t a3,
+                                              uint32_t gp,
+                                              uint32_t priority,
+                                              uint32_t instructionBudget) override
+        {
+            if (address == 0u)
+                return 0u;
+
+            const int threadId = kernel.createTransientThread(
+                address,
+                a0,
+                a1,
+                a2,
+                a3,
+                gp,
+                priority,
+                kCallStackBase,
+                kCallStackSize);
+            if (threadId < 0)
+            {
+                std::ostringstream message;
+                message << "[IOP] failed to create transient guest thread: "
+                        << threadId;
+                host.log(LogLevel::Error, message.str());
+                return 0u;
+            }
+
+            const uint64_t startInstructions = totalInstructions;
+            const uint64_t startCycles = totalCycles;
+            const uint64_t cycleBudget =
+                std::max<uint64_t>(static_cast<uint64_t>(instructionBudget) * 16u,
+                                   0x10000u);
+            while (!kernel.transientThreadComplete(threadId) &&
+                   totalInstructions - startInstructions < instructionBudget &&
+                   totalCycles - startCycles < cycleBudget)
+            {
+                const uint64_t remainingCycles =
+                    cycleBudget - (totalCycles - startCycles);
+                runCycles(std::min<uint64_t>(kDefaultSlice, remainingCycles));
+            }
+
+            uint32_t result = 0u;
+            if (!kernel.takeTransientThreadResult(threadId, result))
+            {
+                kernel.cancelTransientThread(threadId);
+                std::ostringstream message;
+                message << "[IOP] transient guest thread timed out at address 0x"
+                        << std::hex << address << std::dec
+                        << " after " << totalInstructions - startInstructions
+                        << " instructions and " << totalCycles - startCycles
+                        << " cycles";
+                host.log(LogLevel::Error, message.str());
+            }
+            return result;
+        }
+
+        void scheduleGuestFunction(uint32_t address,
+                                   uint32_t a0,
+                                   uint32_t a1,
+                                   uint32_t a2,
+                                   uint32_t a3,
+                                   uint32_t gp,
+                                   uint64_t delayCycles,
+                                   uint32_t instructionBudget) override
+        {
+            pendingGuestCallbacks.emplace(
+                totalCycles + std::max<uint64_t>(delayCycles, 1u),
+                ScheduledGuestCallback{
+                    .function = address,
+                    .gp = gp,
+                    .a0 = a0,
+                    .a1 = a1,
+                    .a2 = a2,
+                    .a3 = a3,
+                    .instructionBudget = instructionBudget,
+                });
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
@@ -536,12 +624,12 @@ namespace ps2x::iop::detail
                     if (callback.function != 0u)
                     {
                         (void)callFunction(callback.function,
-                                           callback.argument,
-                                           0u,
-                                           0u,
-                                           0u,
+                                           callback.a0,
+                                           callback.a1,
+                                           callback.a2,
+                                           callback.a3,
                                            callback.gp,
-                                           100000u);
+                                           callback.instructionBudget);
                     }
                 }
             }
@@ -753,6 +841,13 @@ namespace ps2x::iop::detail
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
+    bool IopEmulator::handleSifCommand(uint32_t commandId,
+                                       const void *packet,
+                                       size_t packetSize)
+    {
+        return m_impl->rpc.handleSifCommand(commandId, packet, packetSize, *m_impl);
+    }
+
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept
     {
         return m_impl->rpc.hasServer(sid);
@@ -827,4 +922,8 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+    std::vector<DebugThread> IopEmulator::debugThreads() const
+    {
+        return m_impl->kernel.debugThreads();
+    }
 }

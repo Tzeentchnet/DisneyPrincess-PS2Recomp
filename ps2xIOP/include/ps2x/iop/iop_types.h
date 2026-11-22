@@ -142,6 +142,20 @@ namespace ps2x::iop
         std::vector<DebugMetric> metrics;
     };
 
+    struct DebugThread
+    {
+        int32_t id = 0;
+        uint32_t state = 0;
+        uint32_t priority = 0;
+        uint32_t pc = 0;
+        uint32_t ra = 0;
+        uint32_t sp = 0;
+        uint32_t entry = 0;
+        int32_t waitId = 0;
+        uint32_t waitBits = 0;
+        uint64_t wakeCycle = 0;
+    };
+
     struct DebugSnapshot
     {
         uint64_t emulatorCycles = 0;
@@ -149,6 +163,7 @@ namespace ps2x::iop
         uint32_t emulatorLoadedModules = 0;
         uint32_t emulatorThreads = 0;
         uint32_t emulatorRpcServers = 0;
+        std::vector<DebugThread> threads;
         std::vector<DebugService> services;
         std::vector<std::string> diagnostics;
     };

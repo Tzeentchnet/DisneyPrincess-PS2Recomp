@@ -1615,7 +1615,7 @@ void register_ps2_memory_tests()
             }
         });
 
-        tc.Run("VIF1 DMA chain ignores tag high bytes when TTE is disabled", [](TestCase &t)
+        tc.Run("VIF1 DMA chain preserves tag high bytes when latched TTE is unavailable", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -1634,8 +1634,8 @@ void register_ps2_memory_tests()
 
             mem.processPendingTransfers();
 
-            t.Equals(mem.vif1_regs.itops, 0u,
-                     "tag high-half VIFcodes must stay hidden when CHCR.TTE is clear");
+            t.Equals(mem.vif1_regs.itops, 0x55u,
+                     "VIF tag high-half codes should survive unreliable latched CHCR.TTE state");
         });
 
         tc.Run("VIF1 packet builders keep chain qwc live before terminate", [](TestCase &t)
@@ -2174,7 +2174,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image continuation preserves intervening VIF codes", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2203,6 +2203,8 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x00u, 0u, 0u)); // NOP remains a VIF code.
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT continuation.
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2224,7 +2226,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "follow-up DIRECT payload should continue the PATH2 image upload");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2256,6 +2258,7 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT continuation.
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
@@ -2275,7 +2278,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+            t.IsTrue(imageOk, "follow-up DIRECT should continue an image after packed setup");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)
