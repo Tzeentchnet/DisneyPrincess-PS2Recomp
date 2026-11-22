@@ -8,8 +8,10 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -19,6 +21,133 @@ using namespace GSInternal;
 
 namespace
 {
+    using GSProfileClock = std::chrono::steady_clock;
+
+    enum class GSProfilePhase : size_t
+    {
+        Submit,
+        LoadClut,
+        BeginTransfer,
+        UploadImage,
+        Present,
+        ClearFramebuffer,
+        Count
+    };
+
+    struct GSProfileState
+    {
+        static constexpr size_t kPrimitiveTypeCount = 7u;
+        static constexpr uint64_t kReportIntervalNanoseconds = 5'000'000'000ull;
+
+        bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_PROFILE_GS");
+            return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        }();
+        GSProfileClock::time_point started = GSProfileClock::now();
+        std::atomic<uint64_t> nextReportNanoseconds{kReportIntervalNanoseconds};
+        std::array<std::atomic<uint64_t>, static_cast<size_t>(GSProfilePhase::Count)> phaseCalls{};
+        std::array<std::atomic<uint64_t>, static_cast<size_t>(GSProfilePhase::Count)> phaseNanoseconds{};
+        std::array<std::atomic<uint64_t>, kPrimitiveTypeCount> primitiveCalls{};
+        std::array<std::atomic<uint64_t>, kPrimitiveTypeCount> primitiveNanoseconds{};
+
+        void Record(GSProfilePhase phase, uint8_t primitiveType, uint64_t elapsedNanoseconds)
+        {
+            const size_t phaseIndex = static_cast<size_t>(phase);
+            phaseCalls[phaseIndex].fetch_add(1u, std::memory_order_relaxed);
+            phaseNanoseconds[phaseIndex].fetch_add(elapsedNanoseconds, std::memory_order_relaxed);
+            if (phase == GSProfilePhase::Submit && primitiveType < kPrimitiveTypeCount)
+            {
+                primitiveCalls[primitiveType].fetch_add(1u, std::memory_order_relaxed);
+                primitiveNanoseconds[primitiveType].fetch_add(elapsedNanoseconds, std::memory_order_relaxed);
+            }
+        }
+
+        void MaybeReport()
+        {
+            const uint64_t elapsedNanoseconds = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(GSProfileClock::now() - started).count());
+            uint64_t next = nextReportNanoseconds.load(std::memory_order_relaxed);
+            if (elapsedNanoseconds < next ||
+                !nextReportNanoseconds.compare_exchange_strong(
+                    next, elapsedNanoseconds + kReportIntervalNanoseconds, std::memory_order_relaxed))
+            {
+                return;
+            }
+
+            auto calls = [&](GSProfilePhase phase)
+            {
+                return phaseCalls[static_cast<size_t>(phase)].load(std::memory_order_relaxed);
+            };
+            auto milliseconds = [&](GSProfilePhase phase)
+            {
+                return phaseNanoseconds[static_cast<size_t>(phase)].load(std::memory_order_relaxed) / 1'000'000ull;
+            };
+
+            std::fprintf(stderr,
+                         "[gs-profile] elapsed_ms=%llu submit=%llu/%llums clut=%llu/%llums "
+                         "begin_transfer=%llu/%llums upload=%llu/%llums present=%llu/%llums clear=%llu/%llums",
+                         static_cast<unsigned long long>(elapsedNanoseconds / 1'000'000ull),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::Submit)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::Submit)),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::LoadClut)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::LoadClut)),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::BeginTransfer)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::BeginTransfer)),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::UploadImage)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::UploadImage)),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::Present)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::Present)),
+                         static_cast<unsigned long long>(calls(GSProfilePhase::ClearFramebuffer)),
+                         static_cast<unsigned long long>(milliseconds(GSProfilePhase::ClearFramebuffer)));
+            for (size_t i = 0; i < kPrimitiveTypeCount; ++i)
+            {
+                std::fprintf(stderr, " prim%llu=%llu/%llums",
+                             static_cast<unsigned long long>(i),
+                             static_cast<unsigned long long>(primitiveCalls[i].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(primitiveNanoseconds[i].load(std::memory_order_relaxed) / 1'000'000ull));
+            }
+            std::fputc('\n', stderr);
+            std::fflush(stderr);
+        }
+    };
+
+    GSProfileState &GetGSProfileState()
+    {
+        static GSProfileState state;
+        return state;
+    }
+
+    class GSProfileScope
+    {
+    public:
+        explicit GSProfileScope(GSProfilePhase phase, uint8_t primitiveType = 0xFFu)
+            : m_state(GetGSProfileState()),
+              m_phase(phase),
+              m_primitiveType(primitiveType)
+        {
+            if (m_state.enabled)
+                m_started = GSProfileClock::now();
+        }
+
+        ~GSProfileScope()
+        {
+            if (!m_state.enabled)
+                return;
+
+            const uint64_t elapsedNanoseconds = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(GSProfileClock::now() - m_started).count());
+            m_state.Record(m_phase, m_primitiveType, elapsedNanoseconds);
+            m_state.MaybeReport();
+        }
+
+    private:
+        GSProfileState &m_state;
+        GSProfilePhase m_phase;
+        uint8_t m_primitiveType;
+        GSProfileClock::time_point m_started{};
+    };
+
     float fabsQ(float q)
     {
         return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
@@ -100,7 +229,6 @@ namespace
     std::atomic<uint32_t> s_debugPixelCount{0};
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
-
     int wrapTextureCoordinate(int coordinate,
                               int textureSize,
                               uint8_t mode,
@@ -545,6 +673,7 @@ void GSCpuBackend::ResetUnlocked()
 
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
+    GSProfileScope profile(GSProfilePhase::Submit, static_cast<uint8_t>(batch.state.prim.type));
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
@@ -553,6 +682,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
+    GSProfileScope profile(GSProfilePhase::LoadClut);
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
@@ -1310,6 +1440,12 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
+    static const bool disableEarlyDepth = std::getenv("PS2X_GS_DISABLE_EARLY_DEPTH") != nullptr;
+    const uint32_t depthMethod = static_cast<uint32_t>((ctx.test >> 17u) & 3u);
+    const bool earlyDepth = !disableEarlyDepth && ((ctx.test >> 16u) & 1u) != 0u && depthMethod >= 2u;
+    const uint32_t depthBase = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
+    const uint32_t depthWidth = std::max<uint32_t>(ctx.frame.fbw, 1u);
+    const auto &depthReader = m_readVramFuncs[ctx.zbuf.psm & 0x3Fu];
 
     for (int y = minY; y <= maxY; ++y)
     {
@@ -1326,6 +1462,14 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                 continue;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const uint32_t pixelZ = static_cast<uint32_t>(z + 0.5);
+
+            if (earlyDepth)
+            {
+                const uint32_t storedZ = depthReader(m_vram, depthBase, depthWidth, x, y);
+                if (pixelZ < storedZ || (depthMethod == 3u && pixelZ == storedZ))
+                    continue;
+            }
 
             uint8_t r, g, b, a;
             if (state.prim.iip)
@@ -1388,7 +1532,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(state, x, y, pixelZ, r, g, b, a, fog);
         }
     }
 }
@@ -1462,6 +1606,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
+    GSProfileScope profile(GSProfilePhase::BeginTransfer);
     std::lock_guard<std::mutex> lock(m_mutex);
     m_transfer = command;
     m_transferState.x = command.trxpos.dsax;
@@ -1479,6 +1624,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
+    GSProfileScope profile(GSProfilePhase::UploadImage);
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;
@@ -1708,6 +1854,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
+    GSProfileScope profile(GSProfilePhase::ClearFramebuffer);
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || context.frame.fbw == 0u)
         return false;
@@ -1845,6 +1992,7 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
 
 PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 {
+    GSProfileScope profile(GSProfilePhase::Present);
     // Snapshot local memory under the backend lock, then perform the expensive
     // display conversion without holding the producer-side raster lock.
     thread_local std::vector<uint8_t> snapshot;

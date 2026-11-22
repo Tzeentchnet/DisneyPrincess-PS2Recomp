@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ps2_pad.h"
 
 namespace ps2_stubs
 {
@@ -66,6 +67,149 @@ namespace ps2_stubs
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+        std::atomic<uint32_t> g_padInputTraceCount{0u};
+
+        bool padInputTraceEnabled()
+        {
+            static const bool enabled = []
+            {
+                const char *value = std::getenv("PS2X_TRACE_PAD_INPUT");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            return enabled;
+        }
+
+        bool hostInputDisabled()
+        {
+            static const bool disabled = []
+            {
+                const char *value = std::getenv("PS2X_DISABLE_HOST_INPUT");
+                const bool result =
+                    value != nullptr && value[0] != '\0' && value[0] != '0';
+                if (result)
+                {
+                    std::fprintf(stderr,
+                                 "[pad:host-input] disabled by PS2X_DISABLE_HOST_INPUT\n");
+                }
+                return result;
+            }();
+            return disabled;
+        }
+
+        struct AutoStartConfig
+        {
+            uint32_t firstRead = 0u;
+            uint32_t periodReads = 16u;
+            uint32_t pulseCount = 0u;
+            uint32_t extraRead = 0u;
+        };
+
+        const AutoStartConfig &autoStartConfig()
+        {
+            static const AutoStartConfig config = []
+            {
+                AutoStartConfig result{};
+                const char *value = std::getenv("PS2X_AUTO_START_READ");
+                if (value == nullptr || value[0] == '\0' ||
+                    (value[0] == '0' && value[1] == '\0'))
+                {
+                    return result;
+                }
+
+                char *end = nullptr;
+                const unsigned long parsed = std::strtoul(value, &end, 0);
+                if (end == value || *end != '\0' || parsed > UINT32_MAX)
+                {
+                    std::fprintf(stderr,
+                                 "[pad:auto-start] invalid PS2X_AUTO_START_READ=%s\n",
+                                 value);
+                    return result;
+                }
+                result.firstRead = static_cast<uint32_t>(parsed);
+
+                value = std::getenv("PS2X_AUTO_START_PERIOD_READS");
+                if (value != nullptr && value[0] != '\0')
+                {
+                    end = nullptr;
+                    const unsigned long period = std::strtoul(value, &end, 0);
+                    if (end == value || *end != '\0' || period < 4u ||
+                        period > UINT32_MAX)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[pad:auto-start] invalid PS2X_AUTO_START_PERIOD_READS=%s\n",
+                            value);
+                    }
+                    else
+                    {
+                        result.periodReads = static_cast<uint32_t>(period);
+                    }
+                }
+
+                value = std::getenv("PS2X_AUTO_START_PULSE_COUNT");
+                if (value != nullptr && value[0] != '\0')
+                {
+                    end = nullptr;
+                    const unsigned long count = std::strtoul(value, &end, 0);
+                    if (end == value || *end != '\0' || count > UINT32_MAX)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[pad:auto-start] invalid PS2X_AUTO_START_PULSE_COUNT=%s\n",
+                            value);
+                    }
+                    else
+                    {
+                        result.pulseCount = static_cast<uint32_t>(count);
+                    }
+                }
+
+                value = std::getenv("PS2X_AUTO_START_EXTRA_READ");
+                if (value != nullptr && value[0] != '\0')
+                {
+                    end = nullptr;
+                    const unsigned long extraRead = std::strtoul(value, &end, 0);
+                    if (end == value || *end != '\0' || extraRead > UINT32_MAX)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[pad:auto-start] invalid PS2X_AUTO_START_EXTRA_READ=%s\n",
+                            value);
+                    }
+                    else
+                    {
+                        result.extraRead = static_cast<uint32_t>(extraRead);
+                    }
+                }
+
+                std::fprintf(stderr,
+                             "[pad:auto-start] enabled firstRead=%u holdReads=4 period=%u "
+                             "pulseCount=%u extraRead=%u\n",
+                             result.firstRead, result.periodReads,
+                             result.pulseCount, result.extraRead);
+                return result;
+            }();
+            return config;
+        }
+
+        uint16_t applyConfiguredAutoStartPulse(uint16_t buttons,
+                                               uint32_t readCount,
+                                               const AutoStartConfig &config)
+        {
+            constexpr uint32_t kHoldReads = 4u;
+            if (config.extraRead != 0u && readCount >= config.extraRead &&
+                readCount - config.extraRead < kHoldReads)
+            {
+                buttons = static_cast<uint16_t>(buttons & ~kPadBtnStart);
+            }
+            if (config.pulseCount != 0u && readCount >= config.firstRead &&
+                (readCount - config.firstRead) / config.periodReads >= config.pulseCount)
+            {
+                return buttons;
+            }
+            return applyAutoStartPulse(buttons, readCount, config.firstRead,
+                                       config.periodReads);
+        }
 
         uint8_t axisToByte(float axis)
         {
@@ -86,7 +230,7 @@ namespace ps2_stubs
         {
             for (int i = 0; i < 4; ++i)
             {
-                if (IsGamepadAvailable(i))
+                if (PS2HostGamepadAvailable(i))
                 {
                     return i;
                 }
@@ -96,7 +240,7 @@ namespace ps2_stubs
 
         void applyGamepadState(PadInputState &state)
         {
-            if (!IsWindowReady())
+            if (!PS2HostWindowReady())
             {
                 return;
             }
@@ -107,40 +251,36 @@ namespace ps2_stubs
                 return;
             }
 
-            // Raylib mapping (PS2 -> raylib buttons/axes):
-            // D-Pad -> LEFT_FACE_*, Cross/Circle/Square/Triangle -> RIGHT_FACE_*
-            // L1/R1 -> TRIGGER_1, L2/R2 -> TRIGGER_2, L3/R3 -> THUMB
-            // Select/Start -> MIDDLE_LEFT/MIDDLE_RIGHT
-            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
-            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
-            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
+            state.lx = axisToByte(PS2HostGamepadAxisMovement(gamepad, PS2HostGamepadAxis::LeftX));
+            state.ly = axisToByte(PS2HostGamepadAxisMovement(gamepad, PS2HostGamepadAxis::LeftY));
+            state.rx = axisToByte(PS2HostGamepadAxisMovement(gamepad, PS2HostGamepadAxis::RightX));
+            state.ry = axisToByte(PS2HostGamepadAxisMovement(gamepad, PS2HostGamepadAxis::RightY));
 
-            setButton(state, kPadBtnUp, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP));
-            setButton(state, kPadBtnDown, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN));
-            setButton(state, kPadBtnLeft, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT));
-            setButton(state, kPadBtnRight, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT));
+            setButton(state, kPadBtnUp, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::DpadUp));
+            setButton(state, kPadBtnDown, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::DpadDown));
+            setButton(state, kPadBtnLeft, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::DpadLeft));
+            setButton(state, kPadBtnRight, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::DpadRight));
 
-            setButton(state, kPadBtnCross, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
-            setButton(state, kPadBtnCircle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT));
-            setButton(state, kPadBtnSquare, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
-            setButton(state, kPadBtnTriangle, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP));
+            setButton(state, kPadBtnCross, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::FaceDown));
+            setButton(state, kPadBtnCircle, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::FaceRight));
+            setButton(state, kPadBtnSquare, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::FaceLeft));
+            setButton(state, kPadBtnTriangle, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::FaceUp));
 
-            setButton(state, kPadBtnL1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1));
-            setButton(state, kPadBtnR1, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1));
-            setButton(state, kPadBtnL2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2));
-            setButton(state, kPadBtnR2, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2));
+            setButton(state, kPadBtnL1, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::LeftShoulder));
+            setButton(state, kPadBtnR1, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::RightShoulder));
+            setButton(state, kPadBtnL2, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::LeftTrigger));
+            setButton(state, kPadBtnR2, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::RightTrigger));
 
-            setButton(state, kPadBtnL3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_THUMB));
-            setButton(state, kPadBtnR3, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB));
+            setButton(state, kPadBtnL3, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::LeftThumb));
+            setButton(state, kPadBtnR3, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::RightThumb));
 
-            setButton(state, kPadBtnSelect, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT));
-            setButton(state, kPadBtnStart, IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT));
+            setButton(state, kPadBtnSelect, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::Select));
+            setButton(state, kPadBtnStart, PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::Start));
         }
 
         void applyKeyboardState(PadInputState &state, bool allowAnalog)
         {
-            if (!IsWindowReady())
+            if (!PS2HostWindowReady())
             {
                 return;
             }
@@ -149,25 +289,25 @@ namespace ps2_stubs
             // D-Pad: arrows, Square/Cross/Circle/Triangle: Z/X/C/V
             // L1/R1: Q/E, L2/R2: 1/3, Start/Select: Enter/RightShift
             // L3/R3: LeftCtrl/RightCtrl, Analog left: WASD
-            setButton(state, kPadBtnUp, IsKeyDown(KEY_UP));
-            setButton(state, kPadBtnDown, IsKeyDown(KEY_DOWN));
-            setButton(state, kPadBtnLeft, IsKeyDown(KEY_LEFT));
-            setButton(state, kPadBtnRight, IsKeyDown(KEY_RIGHT));
+            setButton(state, kPadBtnUp, PS2HostKeyDown(PS2HostKey::Up));
+            setButton(state, kPadBtnDown, PS2HostKeyDown(PS2HostKey::Down));
+            setButton(state, kPadBtnLeft, PS2HostKeyDown(PS2HostKey::Left));
+            setButton(state, kPadBtnRight, PS2HostKeyDown(PS2HostKey::Right));
 
-            setButton(state, kPadBtnSquare, IsKeyDown(KEY_Z));
-            setButton(state, kPadBtnCross, IsKeyDown(KEY_X));
-            setButton(state, kPadBtnCircle, IsKeyDown(KEY_C));
-            setButton(state, kPadBtnTriangle, IsKeyDown(KEY_V));
+            setButton(state, kPadBtnSquare, PS2HostKeyDown(PS2HostKey::Z));
+            setButton(state, kPadBtnCross, PS2HostKeyDown(PS2HostKey::X));
+            setButton(state, kPadBtnCircle, PS2HostKeyDown(PS2HostKey::C));
+            setButton(state, kPadBtnTriangle, PS2HostKeyDown(PS2HostKey::V));
 
-            setButton(state, kPadBtnL1, IsKeyDown(KEY_Q));
-            setButton(state, kPadBtnR1, IsKeyDown(KEY_E));
-            setButton(state, kPadBtnL2, IsKeyDown(KEY_ONE));
-            setButton(state, kPadBtnR2, IsKeyDown(KEY_THREE));
+            setButton(state, kPadBtnL1, PS2HostKeyDown(PS2HostKey::Q));
+            setButton(state, kPadBtnR1, PS2HostKeyDown(PS2HostKey::E));
+            setButton(state, kPadBtnL2, PS2HostKeyDown(PS2HostKey::One));
+            setButton(state, kPadBtnR2, PS2HostKeyDown(PS2HostKey::Three));
 
-            setButton(state, kPadBtnStart, IsKeyDown(KEY_ENTER));
-            setButton(state, kPadBtnSelect, IsKeyDown(KEY_RIGHT_SHIFT));
-            setButton(state, kPadBtnL3, IsKeyDown(KEY_LEFT_CONTROL));
-            setButton(state, kPadBtnR3, IsKeyDown(KEY_RIGHT_CONTROL));
+            setButton(state, kPadBtnStart, PS2HostKeyDown(PS2HostKey::Enter));
+            setButton(state, kPadBtnSelect, PS2HostKeyDown(PS2HostKey::RightShift));
+            setButton(state, kPadBtnL3, PS2HostKeyDown(PS2HostKey::LeftControl));
+            setButton(state, kPadBtnR3, PS2HostKeyDown(PS2HostKey::RightControl));
 
             if (!allowAnalog)
             {
@@ -176,13 +316,13 @@ namespace ps2_stubs
 
             float ax = 0.0f;
             float ay = 0.0f;
-            if (IsKeyDown(KEY_D))
+            if (PS2HostKeyDown(PS2HostKey::D))
                 ax += 1.0f;
-            if (IsKeyDown(KEY_A))
+            if (PS2HostKeyDown(PS2HostKey::A))
                 ax -= 1.0f;
-            if (IsKeyDown(KEY_S))
+            if (PS2HostKeyDown(PS2HostKey::S))
                 ay += 1.0f;
-            if (IsKeyDown(KEY_W))
+            if (PS2HostKeyDown(PS2HostKey::W))
                 ay -= 1.0f;
 
             if (ax != 0.0f || ay != 0.0f)
@@ -296,7 +436,7 @@ namespace ps2_stubs
             }
 
             bool usedBackend = false;
-            if (!useOverride)
+            if (!useOverride && !hostInputDisabled())
             {
                 uint8_t backendData[32]{};
                 if (runtime && runtime->padBackend().readState(port, slot, backendData, sizeof(backendData)))
@@ -315,8 +455,17 @@ namespace ps2_stubs
                 }
             }
 
+            const uint32_t nextReadCount = portState.readCount + 1u;
+            const AutoStartConfig &autoStart = autoStartConfig();
+            const uint16_t autoStartButtons =
+                applyConfiguredAutoStartPulse(state.buttons, nextReadCount, autoStart);
+            const bool usedAutoStart =
+                autoStart.firstRead != 0u && autoStartButtons != state.buttons;
+            state.buttons = autoStartButtons;
+
             fillPadStatus(outData, state, portState);
 
+            uint32_t readCount = 0u;
             {
                 std::lock_guard<std::mutex> lock(g_padStateMutex);
                 if (PadPortState *sharedPortState = lookupPadPortStateLocked(port, slot))
@@ -327,12 +476,47 @@ namespace ps2_stubs
                     sharedPortState->lastUsedBackend = usedBackend;
                     sharedPortState->lastReadOk = true;
                     sharedPortState->lastReadDataAddr = dataAddr;
-                    ++sharedPortState->readCount;
+                    readCount = ++sharedPortState->readCount;
+                }
+            }
+
+            if (padInputTraceEnabled() && state.buttons != 0xFFFFu)
+            {
+                const uint32_t traceIndex = g_padInputTraceCount.fetch_add(1u, std::memory_order_relaxed);
+                if (traceIndex < 64u)
+                {
+                    std::fprintf(stderr,
+                                 "[pad:input] index=%u port=%d slot=%d read=%u source=%s "
+                                 "raw=0x%04x pressed=0x%04x data2=0x%02x data3=0x%02x\n",
+                                 traceIndex,
+                                 port,
+                                 slot,
+                                 readCount,
+                                 usedAutoStart
+                                     ? "auto-start"
+                                     : (useOverride ? "override" : (usedBackend ? "backend" : "fallback")),
+                                 state.buttons,
+                                 static_cast<uint16_t>(state.buttons ^ 0xFFFFu),
+                                 outData[2],
+                                 outData[3]);
                 }
             }
 
             return true;
         }
+    }
+
+    uint16_t applyAutoStartPulse(uint16_t buttons, uint32_t readCount,
+                                 uint32_t firstRead, uint32_t periodReads)
+    {
+        constexpr uint32_t kHoldReads = 4u;
+        if (firstRead == 0u || readCount < firstRead ||
+            periodReads < kHoldReads ||
+            ((readCount - firstRead) % periodReads) >= kHoldReads)
+        {
+            return buttons;
+        }
+        return static_cast<uint16_t>(buttons & ~kPadBtnStart);
     }
 
     void PadSyncCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -648,9 +832,11 @@ namespace ps2_stubs
             {
                 const int gamepad = findFirstGamepad();
                 const bool gamepadStartPressed =
-                    (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
+                    (gamepad >= 0) &&
+                    PS2HostGamepadButtonDown(gamepad, PS2HostGamepadButton::Start);
                 const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
-                                           IsKeyDown(KEY_ENTER) || gamepadStartPressed);
+                                           PS2HostKeyDown(PS2HostKey::Enter) ||
+                                           gamepadStartPressed);
                 if (startPressed)
                 {
                     const uint32_t guestButtons =
@@ -658,7 +844,8 @@ namespace ps2_stubs
                         static_cast<uint32_t>(static_cast<uint8_t>(data[3] ^ 0xFFu));
                     std::printf("[padread] port=%d slot=%d data2=0x%02x data3=0x%02x guestButtons=0x%04x enter=%d gamepadStart=%d\n",
                                 port, slot, data[2], data[3], guestButtons,
-                                IsKeyDown(KEY_ENTER) ? 1 : 0, gamepadStartPressed ? 1 : 0);
+                                PS2HostKeyDown(PS2HostKey::Enter) ? 1 : 0,
+                                gamepadStartPressed ? 1 : 0);
                     ++g_padReadLogCount;
                 }
             }

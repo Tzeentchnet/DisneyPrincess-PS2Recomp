@@ -1,5 +1,8 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -23,9 +26,39 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    // One line: "<pressed mask in hex> [lx ly rx ry]". An unreadable file,
+    // for example one being rewritten, keeps the previous input.
+    void readScriptedInput(const char *path, uint8_t *data)
+    {
+        thread_local unsigned pressed = 0u;
+        thread_local unsigned axes[4] = {kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
+        if (std::FILE *file = std::fopen(path, "r"))
+        {
+            unsigned buttons = 0u;
+            unsigned next[4] = {kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
+            if (std::fscanf(file, "%x %u %u %u %u", &buttons, &next[0], &next[1], &next[2], &next[3]) >= 1)
+            {
+                pressed = buttons;
+                std::copy(next, next + 4, axes);
+            }
+            std::fclose(file);
+        }
+        data[2] = static_cast<uint8_t>(~pressed & 0xFFu);
+        data[3] = static_cast<uint8_t>((~pressed >> 8) & 0xFFu);
+        data[6] = static_cast<uint8_t>(axes[0]);
+        data[7] = static_cast<uint8_t>(axes[1]);
+        data[4] = static_cast<uint8_t>(axes[2]);
+        data[5] = static_cast<uint8_t>(axes[3]);
+    }
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+uint16_t PSPadBackend::mergeActiveLowButtons(uint16_t gamepadButtons, uint16_t keyboardButtons)
+{
+    return static_cast<uint16_t>(gamepadButtons & keyboardButtons);
+}
+
+bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
@@ -37,88 +70,116 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    uint16_t btns = 0xFFFFu;
-    constexpr int kGamepad = 0;
-    const bool useGamepad = IsGamepadAvailable(kGamepad);
-    auto clearBit = [&btns](uint16_t mask)
-    { btns &= ~mask; };
+    // PS2X_INPUT_FILE replaces host input on the first port, for repeatable
+    // runs that do not depend on window focus.
+    static const char *const inputFile = std::getenv("PS2X_INPUT_FILE");
+    if (inputFile && *inputFile)
+    {
+        if (port == 0)
+            readScriptedInput(inputFile, data);
+        return true;
+    }
+
+    const int kGamepad = port;
+    const bool useGamepad = PS2HostGamepadAvailable(kGamepad);
+    uint16_t gamepadButtons = 0xFFFFu;
+    auto clearGamepadBit = [&gamepadButtons](uint16_t mask)
+    { gamepadButtons &= ~mask; };
 
     if (useGamepad)
     {
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
-            clearBit(PAD_UP);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
-            clearBit(PAD_DOWN);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
-            clearBit(PAD_LEFT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
-            clearBit(PAD_RIGHT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
-            clearBit(PAD_CROSS);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
-            clearBit(PAD_CIRCLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
-            clearBit(PAD_SQUARE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
-            clearBit(PAD_TRIANGLE);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
-            clearBit(PAD_L1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
-            clearBit(PAD_R1);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
-            clearBit(PAD_L2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
-            clearBit(PAD_R2);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
-            clearBit(PAD_START);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
-            clearBit(PAD_SELECT);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
-            clearBit(PAD_L3);
-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
-            clearBit(PAD_R3);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::DpadUp))
+            clearGamepadBit(PAD_UP);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::DpadDown))
+            clearGamepadBit(PAD_DOWN);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::DpadLeft))
+            clearGamepadBit(PAD_LEFT);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::DpadRight))
+            clearGamepadBit(PAD_RIGHT);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::FaceDown))
+            clearGamepadBit(PAD_CROSS);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::FaceRight))
+            clearGamepadBit(PAD_CIRCLE);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::FaceLeft))
+            clearGamepadBit(PAD_SQUARE);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::FaceUp))
+            clearGamepadBit(PAD_TRIANGLE);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::LeftShoulder))
+            clearGamepadBit(PAD_L1);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::RightShoulder))
+            clearGamepadBit(PAD_R1);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::LeftTrigger))
+            clearGamepadBit(PAD_L2);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::RightTrigger))
+            clearGamepadBit(PAD_R2);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::Start))
+            clearGamepadBit(PAD_START);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::Select))
+            clearGamepadBit(PAD_SELECT);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::LeftThumb))
+            clearGamepadBit(PAD_L3);
+        if (PS2HostGamepadButtonDown(kGamepad, PS2HostGamepadButton::RightThumb))
+            clearGamepadBit(PAD_R3);
 
-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+        float lx = PS2HostGamepadAxisMovement(kGamepad, PS2HostGamepadAxis::LeftX);
+        float ly = PS2HostGamepadAxisMovement(kGamepad, PS2HostGamepadAxis::LeftY);
+        float rx = PS2HostGamepadAxisMovement(kGamepad, PS2HostGamepadAxis::RightX);
+        float ry = PS2HostGamepadAxisMovement(kGamepad, PS2HostGamepadAxis::RightY);
         data[6] = static_cast<uint8_t>(128 + lx * 127);
         data[7] = static_cast<uint8_t>(128 + ly * 127);
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
-    else
-    {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
-    }
 
+    uint16_t keyboardButtons = 0xFFFFu;
+    if (port != 0) // The keyboard is the first player's.
+    {
+        data[2] = static_cast<uint8_t>(gamepadButtons & 0xFF);
+        data[3] = static_cast<uint8_t>(gamepadButtons >> 8);
+        return true;
+    }
+    auto clearKeyboardBit = [&keyboardButtons](uint16_t mask)
+    { keyboardButtons &= ~mask; };
+    if (PS2HostKeyDown(PS2HostKey::Up))
+        clearKeyboardBit(PAD_UP);
+    if (PS2HostKeyDown(PS2HostKey::Down))
+        clearKeyboardBit(PAD_DOWN);
+    if (PS2HostKeyDown(PS2HostKey::Left))
+        clearKeyboardBit(PAD_LEFT);
+    if (PS2HostKeyDown(PS2HostKey::Right))
+        clearKeyboardBit(PAD_RIGHT);
+
+    // The arrows are the d-pad and WASD is the left stick.
+    const int stickX = (PS2HostKeyDown(PS2HostKey::D) ? 1 : 0) - (PS2HostKeyDown(PS2HostKey::A) ? 1 : 0);
+    const int stickY = (PS2HostKeyDown(PS2HostKey::S) ? 1 : 0) - (PS2HostKeyDown(PS2HostKey::W) ? 1 : 0);
+    if (stickX != 0 || stickY != 0)
+    {
+        const int reach = (stickX != 0 && stickY != 0) ? 90 : 127;
+        data[6] = static_cast<uint8_t>(128 + stickX * reach);
+        data[7] = static_cast<uint8_t>(128 + stickY * reach);
+    }
+    if (PS2HostKeyDown(PS2HostKey::X) || PS2HostKeyDown(PS2HostKey::Space))
+        clearKeyboardBit(PAD_CROSS);
+    if (PS2HostKeyDown(PS2HostKey::C) || PS2HostKeyDown(PS2HostKey::Escape))
+        clearKeyboardBit(PAD_CIRCLE);
+    if (PS2HostKeyDown(PS2HostKey::Z) || PS2HostKeyDown(PS2HostKey::Keypad0))
+        clearKeyboardBit(PAD_SQUARE);
+    if (PS2HostKeyDown(PS2HostKey::V) || PS2HostKeyDown(PS2HostKey::Keypad1))
+        clearKeyboardBit(PAD_TRIANGLE);
+    if (PS2HostKeyDown(PS2HostKey::Q))
+        clearKeyboardBit(PAD_L1);
+    if (PS2HostKeyDown(PS2HostKey::E))
+        clearKeyboardBit(PAD_R1);
+    if (PS2HostKeyDown(PS2HostKey::LeftShift))
+        clearKeyboardBit(PAD_L2);
+    if (PS2HostKeyDown(PS2HostKey::RightShift))
+        clearKeyboardBit(PAD_R2);
+    if (PS2HostKeyDown(PS2HostKey::Enter))
+        clearKeyboardBit(PAD_START);
+    if (PS2HostKeyDown(PS2HostKey::Tab))
+        clearKeyboardBit(PAD_SELECT);
+
+    const uint16_t btns = mergeActiveLowButtons(gamepadButtons, keyboardButtons);
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     return true;

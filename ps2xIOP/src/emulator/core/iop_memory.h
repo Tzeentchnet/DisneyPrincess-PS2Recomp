@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -40,6 +42,7 @@ namespace ps2x::iop::detail
         IopMemory();
 
         void reset();
+        void setClock(const uint64_t *iopCycles) noexcept { m_spu2.setClock(iopCycles); }
 
         [[nodiscard]] uint8_t read8(uint32_t address) const;
         [[nodiscard]] uint16_t read16(uint32_t address) const;
@@ -87,5 +90,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        mutable IopSpu2 m_spu2; // reading a cursor first brings it up to date
     };
 }

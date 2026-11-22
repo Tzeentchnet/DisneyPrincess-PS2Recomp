@@ -178,6 +178,47 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_SQRT_S(-0.0f)), bitsOf(0.0f), "sqrt(-0) should be +0");
         });
 
+        tc.Run("FPU comparisons and extrema treat exponent 255 as finite", [](TestCase &t)
+        {
+            const float plusMax = floatOf(kPlusMax);
+            const float minusMax = floatOf(kMinusMax);
+            const float twoPow128 = floatOf(kTwoPow128);
+            const float denormalBits = floatOf(0x00000001u);
+
+            t.IsTrue(FPU_C_EQ_S(plusMax, plusMax), "the PS2 maximum should equal itself");
+            t.IsTrue(FPU_C_OLT_S(1.0f, twoPow128), "1 should be less than 2^128");
+            t.IsTrue(FPU_C_OLT_S(minusMax, -1.0f), "-max should be less than -1");
+            t.IsTrue(FPU_C_OLE_S(twoPow128, plusMax), "2^128 should be less than or equal to +max");
+            t.IsTrue(FPU_C_EQ_S(denormalBits, 0.0f), "exponent-zero bit patterns should compare as zero");
+            t.IsFalse(FPU_C_UN_S(plusMax, 1.0f), "the PS2 format has no unordered values");
+            t.Equals(bitsOf(ps2_fmax(1.0f, plusMax)), kPlusMax, "MAX.S should select +max");
+            t.Equals(bitsOf(ps2_fmin(minusMax, -1.0f)), kMinusMax, "MIN.S should select -max");
+        });
+
+        tc.Run("CVT.W.S truncates and saturates", [](TestCase &t)
+        {
+            t.Equals(FPU_CVT_W_S(2.75f), 2, "2.75 should truncate to 2");
+            t.Equals(FPU_CVT_W_S(-2.75f), -2, "-2.75 should truncate to -2");
+            t.Equals(FPU_CVT_W_S(3.0e9f), 0x7FFFFFFF, "positive overflow should saturate");
+            t.Equals(FPU_CVT_W_S(-3.0e9f), static_cast<int32_t>(0x80000000u), "negative overflow should saturate");
+        });
+
+        tc.Run("VU0 macro FTOI saturates and FMAC results set MAC", [](TestCase &t)
+        {
+            alignas(16) int32_t converted[4];
+            _mm_store_ps(reinterpret_cast<float *>(converted), ps2_vftoi(_mm_setr_ps(1.75f, -1.75f, 3.0e9f, -3.0e9f), 1.0f));
+            t.Equals(converted[0], 1, "FTOI should truncate");
+            t.Equals(converted[1], -1, "FTOI should truncate toward zero");
+            t.Equals(converted[2], 0x7FFFFFFF, "FTOI should saturate high");
+            t.Equals(converted[3], static_cast<int32_t>(0x80000000u), "FTOI should saturate low");
+
+            alignas(16) R5900Context ctx{};
+            ps2_vu0_update_mac(&ctx, _mm_setr_ps(0.0f, -1.0f, 1.0f, -0.0f), 0xF);
+            t.Equals(static_cast<uint32_t>(ctx.vu0_mac_flags), 0x59u, "x and w are zero, y and w negative");
+            ps2_vu0_update_mac(&ctx, _mm_setr_ps(0.0f, -1.0f, 1.0f, -0.0f), 0x2);
+            t.Equals(static_cast<uint32_t>(ctx.vu0_mac_flags), 0x40u, "only destination lanes should set MAC");
+        });
+
         tc.Run("VU vector ADD/SUB/MUL follow the same rules in every lane", [](TestCase &t)
         {
             // _mm_set_ps lists lanes 3..0
@@ -210,7 +251,7 @@ void register_ps2_float_semantics_tests()
             t.Equals(laneBits(flushed, 3), bitsOf(0.5f), "lane 3: 1 * 0.5 should be 0.5");
         });
 
-        tc.Run("DIV.S and RSQRT.S translate to the PS2 semantics helpers", [](TestCase &t)
+        tc.Run("DIV.S, SQRT.S, RSQRT.S, MIN.S, and MAX.S translate to the PS2 semantics helpers", [](TestCase &t)
         {
             CodeGenerator gen({}, {});
 
@@ -220,9 +261,21 @@ void register_ps2_float_semantics_tests()
                      "DIV.S should write fs / ft to fd but got: " + div);
             t.IsTrue(div.find("INFINITY") == std::string::npos, "DIV.S must not produce IEEE infinity but got: " + div);
 
+            const std::string sqrt = gen.translateInstruction(makeCop1S(COP1_S_SQRT, 2, 3, 4));
+            t.IsTrue(sqrt.find("ctx->f[2] = FPU_SQRT_S(ctx->f[4])") != std::string::npos,
+                     "SQRT.S should compute sqrt(ft) in fd but got: " + sqrt);
+
             const std::string rsqrt = gen.translateInstruction(makeCop1S(COP1_S_RSQRT, 2, 3, 4));
             t.IsTrue(rsqrt.find("ctx->f[2] = FPU_RSQRT_S(ctx->f[3], ctx->f[4])") != std::string::npos,
                      "RSQRT.S should compute fs / sqrt(ft) but got: " + rsqrt);
+
+            const std::string min = gen.translateInstruction(makeCop1S(COP1_S_MIN, 2, 3, 4));
+            t.IsTrue(min.find("ctx->f[2] = ps2_fmin(ctx->f[3], ctx->f[4])") != std::string::npos,
+                     "MIN.S should use PS2 ordering but got: " + min);
+
+            const std::string max = gen.translateInstruction(makeCop1S(COP1_S_MAX, 2, 3, 4));
+            t.IsTrue(max.find("ctx->f[2] = ps2_fmax(ctx->f[3], ctx->f[4])") != std::string::npos,
+                     "MAX.S should use PS2 ordering but got: " + max);
         });
     });
 }

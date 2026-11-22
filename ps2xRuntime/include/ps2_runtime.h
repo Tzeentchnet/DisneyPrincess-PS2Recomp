@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <functional>
+#include <iostream>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -23,26 +24,31 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "ps2_log.h"
 #include "runtime/ps2_address.h"
-#include "runtime/gs/ps2_gif_arbiter.h"
-#include "runtime/ps2_memory.h"
-#include "runtime/gs/gs_frontend.h"
-#include "runtime/ps2_vu1.h"
-#include "runtime/ps2_audio.h"
-#include "runtime/ps2_pad.h"
-#include "runtime/ps2_rom_device.h"
-#include "runtime/ps2_vfs.h"
-#include "ps2x/iop/iop_types.h"
 
 namespace ps2x::iop
 {
+    struct ModuleLoadResult;
+    struct DebugSnapshot;
+    enum class RpcAbi : uint32_t;
+    struct RpcAbiRequest;
+    struct RpcRequest;
+    struct RpcResult;
+    struct SifTransfer;
     class IopSubsystem;
 }
 
+class GifArbiter;
+class PS2AudioBackend;
 class PS2IopHostAdapter;
 class PS2IopTransport;
+class PS2Memory;
+class PSPadBackend;
+class PS2RomDevice;
+class PS2Vfs;
 class EeScheduler;
+class GS;
+class VU1Interpreter;
 struct EeEvent;
 
 enum PS2Exception
@@ -453,10 +459,12 @@ public:
     inline PS2Memory &memory() { return m_memory; }
     inline const PS2Memory &memory() const { return m_memory; }
 
-    inline GS &gs() { return m_gs; }
-    inline const GS &gs() const { return m_gs; }
+    inline GS &gs() { return *m_gs; }
+    inline const GS &gs() const { return *m_gs; }
     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
+    // VU0 data memory as the COP2 load/store macro instructions address it.
+    uint8_t *vu0DataQword(uint32_t qword);
     inline VU1Interpreter &vu0() { return m_vu0; }
     inline const VU1Interpreter &vu0() const { return m_vu0; }
     inline VU1Interpreter &vu1() { return m_vu1; }
@@ -503,18 +511,22 @@ private:
     friend class EeScheduler;
 
 private:
-    PS2Memory m_memory;
-    GifArbiter m_gifArbiter;
-    GS m_gs;
+    struct Components;
+    std::unique_ptr<Components> m_components;
+    PS2Memory &m_memory;
+    GifArbiter &m_gifArbiter;
+    std::unique_ptr<GS> m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
-    PS2AudioBackend m_audioBackend;
-    PSPadBackend m_padBackend;
-    PS2RomDevice m_romDevice;
-    PS2Vfs m_vfs;
-    VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
-    VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
+    PS2AudioBackend &m_audioBackend;
+    PSPadBackend &m_padBackend;
+    PS2RomDevice &m_romDevice;
+    PS2Vfs &m_vfs;
+    VU1Interpreter &m_vu0;
+    VU1Interpreter &m_vu1;
     R5900Context m_cpuContext;
+    // VU1's D/T enables as they were when the running async chain was kicked.
+    uint32_t m_vif1KickFbrst = 0;
     std::unique_ptr<EeScheduler> m_eeScheduler;
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;

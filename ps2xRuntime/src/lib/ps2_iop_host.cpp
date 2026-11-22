@@ -4,6 +4,8 @@
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_audio.h"
+#include "runtime/ps2_vfs.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
 

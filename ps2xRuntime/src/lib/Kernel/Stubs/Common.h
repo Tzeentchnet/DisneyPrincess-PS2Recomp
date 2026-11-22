@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_memory.h"
 #include "ps2_syscalls.h"
 #include "Unimplemented.h"
 

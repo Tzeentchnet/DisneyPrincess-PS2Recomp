@@ -5,6 +5,7 @@
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/recompiler_reporter.h"
 #include "ps2recomp/types.h"
+#include "ps2recomp/control_flow_utils.h"
 
 #include <algorithm>
 #include <sstream>
@@ -44,14 +45,36 @@ namespace ps2recomp
         {
             ss << "#include <stdexcept>\n";
             ss << "#include \"ps2_runtime_macros.h\"\n";
-            ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include <ps2_recompiled_functions.h>\n";
-            ss << "#include <ps2_recompiled_stubs.h>\n\n";
-            ss << "#include \"ps2_syscalls.h\"\n";
-            ss << "#include \"ps2_stubs.h\"\n\n";
             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
             ss << "#include \"ps2_log.h\"\n";
             ss << "#endif\n\n";
+
+            std::vector<std::string> directCallees;
+            for (const Instruction &inst : instructions)
+            {
+                if (inst.opcode != OPCODE_J)
+                {
+                    continue;
+                }
+
+                std::string callee = cg.getFunctionName(buildAbsoluteJumpTarget(inst.address, inst.target));
+                if (!callee.empty())
+                {
+                    directCallees.push_back(std::move(callee));
+                }
+            }
+
+            std::sort(directCallees.begin(), directCallees.end());
+            directCallees.erase(std::unique(directCallees.begin(), directCallees.end()), directCallees.end());
+            for (const std::string &callee : directCallees)
+            {
+                ss << "void " << callee
+                   << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+            }
+            if (!directCallees.empty())
+            {
+                ss << "\n";
+            }
         }
 
         CodeGenerator::AnalysisResult analysisResult = cg.collectInternalBranchTargets(function, instructions);

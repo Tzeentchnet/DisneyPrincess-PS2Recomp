@@ -105,8 +105,14 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+    void shutdownBackend();
+    uint64_t getReadbackCount() const;
+    // Submits batched GPU work. The presentation thread cannot end a frame on
+    // the shared device while this thread holds an open command buffer, so this
+    // runs at vblank and whenever the EE goes idle.
+    void submitPendingHostWork();
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path = 3);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -119,9 +125,9 @@ public:
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
     void unlockDisplaySnapshot();
     uint32_t getLastDisplayBaseBytes() const;
-    const GSFrameReg &getContextFrame(int index) const
+    GSFrameReg getContextFrame(int index) const
     {
-        return m_ctx[(index != 0) ? 1 : 0].frame;
+        return getDebugSnapshot().ctx[(index != 0) ? 1 : 0].frame;
     }
     GSDebugSnapshot getDebugSnapshot() const;
     std::vector<GSDebugHistoryEntry> getDebugHistory() const;
@@ -130,6 +136,7 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    std::shared_ptr<GSGpuFrame> getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -222,7 +229,11 @@ private:
     GSFrameReg m_preferredDisplaySourceFrame{};
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
+    bool m_mirroringRawCommands = false;
+    bool m_hostWorkPending = false;
     std::vector<uint8_t> m_hostPresentationFrame;
+    std::shared_ptr<GSGpuFrame> m_hostPresentationGpuFrame;
+    float m_hostPresentationAspectRatio = 0.0f;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;

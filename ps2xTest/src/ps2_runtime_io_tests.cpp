@@ -2,6 +2,8 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/ps2_memory.h"
+#include "runtime/ps2_rom_device.h"
 
 #include <filesystem>
 #include <fstream>

@@ -3,13 +3,14 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
-#include "Stubs/Helpers/Support.h"
+#include "Stubs/Common.h"
 #include "Stubs/GS.h"
 
 #include <atomic>
@@ -503,7 +504,7 @@ void register_ps2_gs_tests()
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             R5900Context ctx{};
             setRegU32(ctx, 4, 1u); // interlaced
-            setRegU32(ctx, 5, 0u); // NTSC
+            setRegU32(ctx, 5, 2u); // NTSC (GS CRT mode 0x02)
             setRegU32(ctx, 6, 0u); // field mode
 
             runtime.memory().gs().pmode = 0u;
@@ -512,6 +513,10 @@ void register_ps2_gs_tests()
 
             t.Equals(runtime.memory().gs().smode2, 0x1ull,
                      "GsSetCrt should publish interlaced field mode through SMODE2");
+            t.Equals((runtime.memory().gs().smode1 >> 3) & 127ull, 32ull,
+                     "GsSetCrt should program the analog clock for the hardware CRTC");
+            t.Equals((runtime.memory().gs().smode1 >> 13) & 3ull, 2ull,
+                     "GsSetCrt should program NTSC in SMODE1");
             t.Equals(runtime.memory().gs().pmode & 0x3ull, 0x1ull,
                      "GsSetCrt should leave CRT1 enabled for presentation");
             t.Equals(getRegU32Test(ctx, 2), 0u,
@@ -557,8 +562,9 @@ void register_ps2_gs_tests()
             std::memcpy(&xyoffset10Addr, rdram.data() + kEnvAddr + kXYOffset1AddrOffset, sizeof(xyoffset10Addr));
 
             t.Equals((dispfb0 >> 9) & 0x3Fu, 10ull, "dbuff display env should seed FBW from width");
-            t.Equals((display0 >> 32) & 0x0FFFull, 639ull, "dbuff display env should seed DW from width");
-            t.Equals((display0 >> 44) & 0x07FFull, 447ull, "dbuff display env should seed DH from height");
+            t.Equals((display0 >> 23) & 0x0Full, 3ull, "NTSC should use four output clocks per pixel");
+            t.Equals((display0 >> 32) & 0x0FFFull, 2559ull, "DW is measured in output clocks, not framebuffer pixels");
+            t.Equals((display0 >> 44) & 0x07FFull, 895ull, "interlaced frame mode should double the supplied height");
             t.Equals((frame10 >> 16) & 0x3Full, 10ull, "dbuff draw env should seed FRAME FBW from width");
             t.Equals(frame10Addr, 0x4Cull, "dbuff draw env should seed FRAME_1 register id");
             t.Equals(xyoffset10 & 0xFFFFull, 0x6C00ull, "dbuff draw env should seed OFX in 12.4 fixed point");
@@ -572,6 +578,12 @@ void register_ps2_gs_tests()
             dispfb1 = (dispfb1 & ~0x1FFull) | 151ull;
             std::memcpy(rdram.data() + kEnvAddr + kDispEnvSize + kDispFbOffset, &dispfb1, sizeof(dispfb1));
 
+            // Exercise both circuits so the SDK shortcut must update the same
+            // per-circuit counters as native GS and MMIO writes.
+            const uint64_t pmode = 3u;
+            std::memcpy(rdram.data() + kEnvAddr, &pmode, sizeof(pmode));
+            std::memcpy(rdram.data() + kEnvAddr + kDispEnvSize, &pmode, sizeof(pmode));
+
             std::memset(&ctx, 0, sizeof(ctx));
             setRegU32(ctx, 4, kEnvAddr);
             setRegU32(ctx, 5, 1u);
@@ -579,8 +591,92 @@ void register_ps2_gs_tests()
 
             t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
                      "sceGsSwapDBuffDc should program GS to the selected display page");
-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
+            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 2559ull,
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
+            auto &regs = runtime.memory().gs();
+            t.Equals(regs.displayFlipCount[0].load(), uint64_t(1), "SDK swap must count the first display flip");
+            t.Equals(regs.displayFlipCount[1].load(), uint64_t(1), "SDK swap must count the second circuit independently");
+            ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            t.Equals(regs.displayFlipCount[0].load(), uint64_t(1), "repeating the SDK swap must not add a flip");
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            t.Equals(regs.displayFlipCount[0].load(), uint64_t(2), "SDK swap back to the other page must count");
+            t.Equals(regs.displayFlipCount[1].load(), uint64_t(2), "SDK swap back must count for both circuits");
+            t.Equals(regs.sdkPresentCount.load(), uint64_t(3), "each completed SDK swap counts once, not once per circuit");
+
+            // Retail games can alternate draw buffers while both display envs
+            // point at one scanout page. FBP changes cannot measure their FPS.
+            std::memcpy(rdram.data() + kEnvAddr + kDispEnvSize + kDispFbOffset, &dispfb0, sizeof(dispfb0));
+            setRegU32(ctx, 5, 1u);
+            ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            t.Equals(regs.sdkPresentCount.load(), uint64_t(5), "fixed scanout page must still count SDK presentations");
+            t.Equals(regs.displayFlipCount[0].load(), uint64_t(2), "SDK presentation must not fabricate a buffer flip");
+            ps2_stubs::sceGsSwapDBuff(rdram.data(), &ctx, &runtime);
+            t.Equals(regs.sdkPresentCount.load(), uint64_t(6), "non-DC SDK swap also counts once");
+            ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, nullptr);
+            t.Equals(regs.sdkPresentCount.load(), uint64_t(6), "failed swap must not count as a presentation");
+        });
+
+        tc.Run("sceGsSetDefDispEnv matches libgs display timing and initializes every register", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t envAddr = 0x4000u;
+            struct ModeCase
+            {
+                uint32_t mode, interlace, frame, width, height;
+                int32_t dx, dy;
+                uint64_t smode2, expectedDx, expectedDy, magh, dw, dh;
+            };
+            // Expected fields from sceGsSetDefDispEnv at 0x100248 in SLUS_201.84.
+            const ModeCase cases[] = {
+                {2, 1, 1, 640, 224, 0, 0, 3, 636, 50, 3, 2559, 447},
+                {2, 1, 0, 640, 448, 0, 0, 1, 636, 50, 3, 2559, 447},
+                {2, 0, 0, 640, 224, 0, 0, 2, 636, 25, 3, 2559, 223},
+                {3, 1, 1, 512, 256, 0, 0, 3, 656, 72, 4, 2559, 511},
+                {3, 0, 1, 640, 256, 0, 0, 2, 656, 36, 3, 2559, 255},
+                {2, 1, 1, 640, 224, -4, -2, 3, 620, 48, 3, 2559, 447},
+            };
+            for (const auto &mode : cases)
+            {
+                R5900Context ctx{};
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, mode.interlace);
+                setRegU32(ctx, 6, mode.mode);
+                setRegU32(ctx, 7, mode.frame);
+                ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
+                ps2_stubs::sceGsGetGParam(rdram.data(), &ctx, &runtime);
+                const uint32_t params = getRegU32Test(ctx, 2);
+                t.Equals(runtime.memory().read16(params), static_cast<uint16_t>(mode.interlace), "GParam interlace occupies a halfword");
+                t.Equals(runtime.memory().read16(params + 2), static_cast<uint16_t>(mode.mode), "GParam output mode is at offset 2");
+                t.Equals(runtime.memory().read16(params + 4), static_cast<uint16_t>(mode.frame), "GParam frame mode is at offset 4");
+                t.Equals(runtime.memory().read16(params + 6), uint16_t(3), "GParam version is at offset 6");
+                std::memset(rdram.data() + envAddr, 0xcd, 40);
+                setRegU32(ctx, 4, envAddr);
+                setRegU32(ctx, 5, 0u);
+                setRegU32(ctx, 6, mode.width);
+                setRegU32(ctx, 7, mode.height);
+                setRegU32(ctx, 8, static_cast<uint32_t>(mode.dx));
+                setRegU32(ctx, 9, static_cast<uint32_t>(mode.dy));
+                setRegU32(ctx, 29, 0x3000u);
+                const uint32_t staleStackArgs[2] = {123u, 456u};
+                std::memcpy(rdram.data() + 0x3010, staleStackArgs, sizeof(staleStackArgs));
+                ps2_stubs::sceGsSetDefDispEnv(rdram.data(), &ctx, &runtime);
+                uint64_t regs[5]{};
+                std::memcpy(regs, rdram.data() + envAddr, sizeof(regs));
+                t.Equals(regs[0], 0x66ull, "PMODE should enable circuit 2 with fixed alpha");
+                t.Equals(regs[1], mode.smode2, "SMODE2 should follow the libgs mode");
+                t.Equals(regs[2], uint64_t((mode.width + 63) / 64) << 9, "DISPFB should encode the framebuffer stride");
+                t.Equals(regs[3] & 0xfffull, mode.expectedDx, "DX should include the CRT origin and scaled offset");
+                t.Equals((regs[3] >> 12) & 0x7ffull, mode.expectedDy, "DY should include the CRT origin");
+                t.Equals((regs[3] >> 23) & 15ull, mode.magh, "MAGH should match the output clock multiplier");
+                t.Equals((regs[3] >> 32) & 0xfffull, mode.dw, "DW should cover the output clocks");
+                t.Equals((regs[3] >> 44) & 0x7ffull, mode.dh, "DH should match field or frame mode");
+                t.Equals(regs[4], 0ull, "BGCOLOR should be initialized even in dirty guest memory");
+            }
         });
 
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
@@ -3637,6 +3733,154 @@ void register_ps2_gs_tests()
                      "REGION_REPEAT should calculate (U & UMSK) | UFIX");
         });
 
+        tc.Run("GS early depth preserves GEQUAL and GREATER stores across Z formats", [](TestCase &t)
+        {
+            for (uint8_t format : {GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S})
+            for (uint32_t method = 0u; method < 4u; ++method)
+            for (bool masked : {false, true})
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GSCpuBackend backend;
+                backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+                GSPrimitiveBatch batch{};
+                batch.vertexCount = 3u;
+                batch.state.prim.type = GS_PRIM_TRIANGLE;
+                batch.state.context.frame = {0u, 1u, GS_PSM_CT32, 0u};
+                batch.state.context.zbuf = {1u, format, masked};
+                batch.state.context.scissor = {0u, 7u, 0u, 7u};
+                batch.state.context.test = (1ull << 16u) | (static_cast<uint64_t>(method) << 17u);
+                batch.vertices[0].x = 0.0f;
+                batch.vertices[0].y = 0.0f;
+                batch.vertices[1].x = 8.0f;
+                batch.vertices[1].y = 0.0f;
+                batch.vertices[2].x = 0.0f;
+                batch.vertices[2].y = 8.0f;
+                for (auto &vertex : batch.vertices)
+                {
+                    vertex.z = 256.0;
+                    vertex.r = 0x12u;
+                    vertex.g = 0x34u;
+                    vertex.b = 0x56u;
+                    vertex.a = 0x80u;
+                }
+                for (uint32_t x = 1u; x <= 3u; ++x)
+                {
+                    backend.WriteVram(GS_PSM_CT32, 0u, 1u, x, 1u, 0xAABBCCDDu);
+                    backend.WriteVram(format, 32u, 1u, x, 1u, 254u + x);
+                }
+                backend.Submit(batch);
+                for (uint32_t x = 1u; x <= 3u; ++x)
+                {
+                    const uint32_t stored = 254u + x;
+                    const bool passes = method == 1u || (method == 2u && 256u >= stored) ||
+                        (method == 3u && 256u > stored);
+                    t.Equals(backend.ReadVram(GS_PSM_CT32, 0u, 1u, x, 1u),
+                             passes ? 0x80563412u : 0xAABBCCDDu,
+                             "depth comparison must preserve the expected color store");
+                    t.Equals(backend.ReadVram(format, 32u, 1u, x, 1u),
+                             passes && !masked ? 256u : stored,
+                             "depth rejection or ZMSK must preserve stored depth");
+                }
+            }
+        });
+
+        tc.Run("GS early depth differential workload covers texture alpha fog and masks", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSCpuBackend backend;
+            backend.Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+            constexpr std::array<uint8_t, 4> frameFormats{
+                GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S};
+            constexpr std::array<uint8_t, 4> depthFormats{
+                GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S};
+            uint32_t random = 0xB16821F3u;
+            auto next = [&]() { random = random * 1664525u + 1013904223u; return random; };
+            uint64_t hash = 14695981039346656037ull;
+            uint32_t changedCases = 0u;
+            for (uint32_t index = 0u; index < 128u; ++index)
+            {
+                std::fill(vram.begin(), vram.end(), 0x3Du);
+                GSPrimitiveBatch batch{};
+                batch.vertexCount = 3u;
+                auto &state = batch.state;
+                auto &ctx = state.context;
+                state.prim.type = GS_PRIM_TRIANGLE;
+                state.prim.tme = true;
+                state.prim.iip = (index & 1u) != 0u;
+                state.prim.fst = (index & 2u) != 0u;
+                state.prim.abe = (index & 4u) != 0u;
+                state.prim.fge = (index & 8u) != 0u;
+                state.pabe = (index & 16u) != 0u;
+                state.colclamp = 1u;
+                state.fogR = 0x34u;
+                state.fogG = 0x56u;
+                state.fogB = 0x78u;
+                state.textureWidth = state.textureHeight = 16u;
+                state.linearFilter = (index & 32u) != 0u;
+                ctx.frame = {0u, 1u, frameFormats[index & 3u], (index & 16u) ? 0x005A005Au : 0u};
+                ctx.zbuf = {32u, depthFormats[(index >> 2u) & 3u], (index & 8u) != 0u};
+                ctx.scissor = {2u, 29u, 1u, 30u};
+                ctx.tex0.tbp0 = 2048u;
+                ctx.tex0.tbw = 1u;
+                ctx.tex0.psm = GS_PSM_T8;
+                ctx.tex0.tw = ctx.tex0.th = 4u;
+                ctx.tex0.tcc = 1u;
+                ctx.tex0.tfx = static_cast<uint8_t>(index & 3u);
+                ctx.tex0.cbp = 4096u;
+                ctx.tex0.cpsm = GS_PSM_CT32;
+                ctx.tex0.cld = 1u;
+                ctx.clamp = static_cast<uint64_t>(index & 15u) | (15ull << 14u) | (15ull << 34u);
+                ctx.test = 1ull | ((index & 7ull) << 1u) | (0x70ull << 4u) |
+                    (((index >> 3u) & 3ull) << 12u) | (1ull << 16u) |
+                    (((index >> 5u) & 3ull) << 17u);
+                if ((index & 16u) != 0u)
+                    ctx.test |= (1ull << 14u) | ((index & 1ull) << 15u);
+                ctx.alpha = 0x44ull | (0x60ull << 32u);
+                ctx.fba = index & 1u;
+                for (uint32_t y = 0u; y < 32u; ++y)
+                for (uint32_t x = 0u; x < 32u; ++x)
+                {
+                    backend.WriteVram(ctx.frame.psm, 0u, 1u, x, y, next());
+                    backend.WriteVram(ctx.zbuf.psm, 1024u, 1u, x, y, 32766u + (next() % 5u));
+                }
+                for (uint32_t y = 0u; y < 16u; ++y)
+                for (uint32_t x = 0u; x < 16u; ++x)
+                {
+                    backend.WriteVram(GS_PSM_T8, 2048u, 1u, x, y, next() & 255u);
+                    backend.WriteVram(GS_PSM_CT32, 4096u, 1u, x, y, next());
+                }
+                const float xs[] = {-2.0f, 34.0f, 5.0f};
+                const float ys[] = {2.0f, 7.0f, 35.0f};
+                for (uint32_t vertexIndex = 0u; vertexIndex < 3u; ++vertexIndex)
+                {
+                    auto &vertex = batch.vertices[vertexIndex];
+                    vertex.x = xs[vertexIndex];
+                    vertex.y = ys[vertexIndex];
+                    vertex.z = 32768.0 + (static_cast<int>(vertexIndex) - 1) * 2.0;
+                    vertex.q = 0.5f + static_cast<float>(vertexIndex);
+                    vertex.s = static_cast<float>(vertexIndex);
+                    vertex.t = 2.0f - vertex.s;
+                    vertex.u = static_cast<uint16_t>(vertexIndex * 8u * 16u);
+                    vertex.v = static_cast<uint16_t>((2u - vertexIndex) * 8u * 16u);
+                    vertex.r = static_cast<uint8_t>(next() >> 24u);
+                    vertex.g = static_cast<uint8_t>(next() >> 24u);
+                    vertex.b = static_cast<uint8_t>(next() >> 24u);
+                    vertex.a = static_cast<uint8_t>(next() >> 24u);
+                    vertex.fog = static_cast<uint8_t>(next() >> 24u);
+                }
+                const auto before = vram;
+                backend.Submit(batch);
+                if (before != vram)
+                    ++changedCases;
+                for (uint8_t byte : vram)
+                    hash = (hash ^ byte) * 1099511628211ull;
+            }
+            std::printf("[gs-depth-differential] cases=128 hash=%016llx\n",
+                        static_cast<unsigned long long>(hash));
+            t.IsTrue(changedCases > 0u && changedCases < 128u,
+                     "the workload must exercise both stores and rejected draws");
+        });
+
         tc.Run("GS STQ triangle interpolation divides homogeneous coordinates after DDA", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
@@ -4116,7 +4360,7 @@ void register_ps2_gs_tests()
                       "TRXDIR payload must encode dir=0 (host-to-local)");
         });
 
-        tc.Run("sceGsResetGraph frees its temporary GIF packet", [](TestCase &t)
+        tc.Run("sceGsResetGraph programs the CRT without sending privileged registers through GIF", [](TestCase &t)
         {
             PS2Runtime runtime;
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
@@ -4131,8 +4375,21 @@ void register_ps2_gs_tests()
 
             t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
                      "sceGsResetGraph should succeed in reset mode");
+            const auto &regs = runtime.memory().gs();
+            t.Equals((regs.smode1 >> 3) & 127ull, 32ull, "reset should select the analog clock");
+            t.Equals((regs.smode1 >> 13) & 3ull, 2ull, "reset should select NTSC");
+            t.Equals(regs.smode2, 3ull, "reset should select interlaced frame mode");
+            t.Equals(regs.pmode & 3ull, 1ull, "reset should enable circuit 1");
+            t.Equals(regs.dispfb1, 10ull << 9, "reset should set the display buffer width");
+            t.Equals(regs.dispfb2, regs.dispfb1, "reset should initialize both display buffers");
+            t.Equals(runtime.gs().getDebugSnapshot().ctx[1].alpha, 0ull,
+                     "PMODE must not be sent to GIF register 0x41 (ALPHA_2)");
+
+            setRegU32(ctx, 6, 3u);
+            ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
+            t.Equals((regs.smode1 >> 13) & 3ull, 3ull, "reset should also select PAL");
             expectGuestHeapReusable(t, runtime,
-                                    "sceGsResetGraph should free its temporary GIF packet");
+                                    "sceGsResetGraph should leave the guest heap reusable");
         });
 
         tc.Run("sceGsSyncV resumes through the scheduler with deterministic field parity", [](TestCase &t)

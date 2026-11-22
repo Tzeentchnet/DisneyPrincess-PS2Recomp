@@ -1,6 +1,8 @@
 #include "MiniTest.h"
+#include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include "runtime/ps2_pad.h"
 #include "Stubs/Pad.h"
 
 #include <vector>
@@ -138,6 +140,44 @@ void register_pad_input_tests()
 
             ps2_stubs::clearPadOverrideState();
             closePadPort(ctx, rdram);
+        });
+
+        tc.Run("host pad backend merges keyboard and gamepad buttons", [](TestCase &t)
+               {
+            const uint16_t gamepadButtons =
+                static_cast<uint16_t>(0xFFFFu & ~kPadBtnCircle);
+            const uint16_t keyboardButtons =
+                static_cast<uint16_t>(0xFFFFu & ~kPadBtnStart & ~kPadBtnCross);
+            const uint16_t expected =
+                static_cast<uint16_t>(0xFFFFu & ~kPadBtnCircle & ~kPadBtnStart & ~kPadBtnCross);
+
+            t.Equals(PSPadBackend::mergeActiveLowButtons(gamepadButtons, keyboardButtons),
+                     expected,
+                     "keyboard buttons should remain visible while a gamepad is connected");
+        });
+
+        tc.Run("auto Start pulses are counted in guest pad reads", [](TestCase &t)
+               {
+            constexpr uint32_t firstRead = 400u;
+
+            t.Equals(ps2_stubs::applyAutoStartPulse(0xFFFFu, firstRead - 1u, firstRead),
+                     static_cast<uint16_t>(0xFFFFu),
+                     "reads before the configured threshold should stay neutral");
+            for (uint32_t read = firstRead; read < firstRead + 4u; ++read)
+            {
+                t.IsTrue((ps2_stubs::applyAutoStartPulse(0xFFFFu, read, firstRead) & kPadBtnStart) == 0u,
+                         "the first four guest reads should hold Start");
+            }
+            t.Equals(ps2_stubs::applyAutoStartPulse(0xFFFFu, firstRead + 4u, firstRead),
+                     static_cast<uint16_t>(0xFFFFu),
+                     "the pulse should release after four guest reads");
+            t.IsTrue((ps2_stubs::applyAutoStartPulse(0xFFFFu, firstRead + 16u, firstRead) & kPadBtnStart) == 0u,
+                     "the pulse should repeat after sixteen guest reads");
+            t.Equals(ps2_stubs::applyAutoStartPulse(0xFFFFu, firstRead + 16u, firstRead, 40u),
+                     static_cast<uint16_t>(0xFFFFu),
+                     "a custom period should not pulse at the default interval");
+            t.IsTrue((ps2_stubs::applyAutoStartPulse(0xFFFFu, firstRead + 40u, firstRead, 40u) & kPadBtnStart) == 0u,
+                     "a custom period should control the next pulse");
         });
 
         tc.Run("scePadGetButtonMask returns all buttons", [](TestCase &t)

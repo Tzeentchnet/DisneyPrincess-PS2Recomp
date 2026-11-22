@@ -4,9 +4,38 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
 
 namespace
 {
+    // normalizeOperand on four lanes.
+    void normalizeOperands(const float *in, float *out)
+    {
+#if defined(__SSE4_1__)
+        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(in));
+        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        __m128i normalized = _mm_blendv_epi8(bits, sign, _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
+        normalized = _mm_blendv_epi8(normalized, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)),
+                                     _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000)));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(out), normalized);
+#else
+        for (uint32_t lane = 0; lane < 4u; ++lane)
+        {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &in[lane], sizeof(bits));
+            const uint32_t exponent = (bits >> 23) & 0xFFu;
+            if (exponent == 0u)
+                bits &= 0x80000000u;
+            else if (exponent == 0xFFu)
+                bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+            std::memcpy(&out[lane], &bits, sizeof(bits));
+        }
+#endif
+    }
+
     int32_t vuFloatToInt(float value, float scale)
     {
         const double scaled = static_cast<double>(value) * static_cast<double>(scale);
@@ -29,22 +58,79 @@ void VU1Interpreter::execUpper(uint32_t instr)
     uint8_t fs = FS(instr);
     uint8_t fd = FD(instr);
     uint8_t op = instr & 0x3F;
+    const bool specialGroup = op >= 0x3Cu;
+    const uint8_t specialOp = specialGroup
+                                  ? static_cast<uint8_t>((instr & 0x3u) |
+                                                         ((instr >> 4) & 0x7Cu))
+                                  : 0xFFu;
+
+    if ((!specialGroup && op >= 0x30u) ||
+        (specialGroup && (specialOp == 0x2Fu || specialOp == 0x30u)))
+    {
+        if (!specialGroup || specialOp > 0x30u)
+            reportReservedInstruction(true, instr);
+        return;
+    }
 
     float *vd = m_state.vf[fd];
     float normalizedVs[4];
     float normalizedVt[4];
     float normalizedAcc[4];
-    for (uint32_t component = 0; component < 4u; ++component)
+    bool needsVs = true;
+    bool needsVt = false;
+    bool needsAcc = false;
+    bool needsQ = false;
+    bool needsI = false;
+    if (!specialGroup)
     {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        needsVt = op <= 0x1Bu || op >= 0x28u;
+        needsAcc = (op >= 0x08u && op <= 0x0Fu) ||
+                   op == 0x21u || op == 0x23u || op == 0x25u ||
+                   op == 0x27u || op == 0x29u || op == 0x2Du ||
+                   op == 0x2Eu;
+        needsQ = op == 0x1Cu || op == 0x20u || op == 0x21u ||
+                 op == 0x24u || op == 0x25u;
+        needsI = op == 0x1Du || op == 0x1Eu || op == 0x1Fu ||
+                 op == 0x22u || op == 0x23u || op == 0x26u ||
+                 op == 0x27u;
     }
+    else
+    {
+        needsVs = !((specialOp >= 0x10u && specialOp <= 0x13u) ||
+                    specialOp == 0x1Fu);
+        needsVt = specialOp <= 0x0Fu ||
+                  (specialOp >= 0x18u && specialOp <= 0x1Bu) ||
+                  specialOp == 0x28u || specialOp == 0x29u ||
+                  specialOp == 0x2Au || specialOp == 0x2Cu ||
+                  specialOp == 0x2Du || specialOp == 0x2Eu;
+        needsAcc = (specialOp >= 0x08u && specialOp <= 0x0Fu) ||
+                   specialOp == 0x21u || specialOp == 0x23u ||
+                   specialOp == 0x25u || specialOp == 0x27u ||
+                   specialOp == 0x29u || specialOp == 0x2Du;
+        needsQ = specialOp == 0x1Cu || specialOp == 0x20u ||
+                 specialOp == 0x21u || specialOp == 0x24u ||
+                 specialOp == 0x25u;
+        needsI = specialOp == 0x1Eu || specialOp == 0x22u ||
+                 specialOp == 0x23u || specialOp == 0x26u ||
+                 specialOp == 0x27u;
+    }
+
+    if (needsVs)
+        normalizeOperands(m_state.vf[fs], normalizedVs);
+    if (needsVt)
+        normalizeOperands(m_state.vf[ft], normalizedVt);
+    if (needsAcc)
+        normalizeOperands(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = needsQ ? normalizeOperand(m_state.q) : 0.0f;
+    const float i = needsI ? normalizeOperand(m_state.i) : 0.0f;
+    m_fmacVs = vs;
+    m_fmacVt = vt;
+    m_fmacAcc = acc;
+    m_fmacQ = q;
+    m_fmacI = i;
     float result[4];
 
     // Upper opcode decoding (bits 5:0 of upper word)
@@ -239,7 +325,6 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x3E:
     case 0x3F:
     {
-        const uint8_t specialOp = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
         float *vtDest = m_state.vf[ft];
 
         switch (specialOp)

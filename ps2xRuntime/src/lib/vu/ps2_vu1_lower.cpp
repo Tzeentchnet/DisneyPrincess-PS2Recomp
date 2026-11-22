@@ -109,7 +109,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         {
             uint32_t words[4]{};
             std::memcpy(words, m_state.vf[is], sizeof(words));
-            queueStore(addr, words, dest);
+            storeWords(addr, words, dest);
         }
         return;
     }
@@ -151,7 +151,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         {
             const uint32_t val = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[it] & 0xFFFF));
             const uint32_t words[4] = {val, val, val, val};
-            queueStore(addr, words, dest);
+            storeWords(addr, words, dest);
         }
         return;
     }
@@ -462,7 +462,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 {
                     uint32_t words[4]{};
                     std::memcpy(words, m_state.vf[vfS], sizeof(words));
-                    queueStore(addr, words, dest);
+                    storeWords(addr, words, dest);
                 }
                 if (viT != 0)
                     m_state.vi[viT] = (int16_t)(m_state.vi[viT] + 1);
@@ -492,7 +492,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 {
                     uint32_t words[4]{};
                     std::memcpy(words, m_state.vf[vfS], sizeof(words));
-                    queueStore(addr, words, dest);
+                    storeWords(addr, words, dest);
                 }
                 return;
             }
@@ -606,7 +606,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     const uint32_t val =
                         static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viT] & 0xFFFF));
                     const uint32_t words[4] = {val, val, val, val};
-                    queueStore(addr, words, dest);
+                    storeWords(addr, words, dest);
                 }
                 return;
             }

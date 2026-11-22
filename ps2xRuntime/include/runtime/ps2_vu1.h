@@ -3,6 +3,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 
 class GS;
 class PS2Memory;
@@ -37,13 +39,13 @@ struct VU1State
 
 struct VU1XgkickDebugState
 {
+    bool active = false;
     uint32_t sourceAddress = 0;
     uint32_t totalBytes = 0;
     uint32_t copiedBytes = 0;
     uint32_t currentTagEnd = 0;
     uint32_t cycleCredit = 0;
     uint64_t issueCycle = 0;
-    bool active = false;
     bool currentTagEop = false;
 };
 
@@ -73,7 +75,7 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
-    [[nodiscard]] VU1XgkickDebugState xgkickDebugState() const;
+    VU1XgkickDebugState xgkickDebugState() const;
 
 private:
     enum Pipeline : uint8_t
@@ -115,10 +117,40 @@ private:
         bool reserved = false;
     };
 
+    // An upper instruction, decoded once when the micro memory changes.
+    struct UpperInstruction
+    {
+        uint8_t kind = 0; // UpperKind
+        uint8_t broadcast = 0;
+        uint8_t fs = 0;
+        uint8_t ft = 0;
+        uint8_t destination = 0;
+        uint8_t lanes = 0; // DEST with bit 0 = x, as movemask reports it.
+    };
+
+    // The same for the lower instructions that make up most programs.
+    struct LowerInstruction
+    {
+        uint8_t kind = 0; // LowerKind
+        uint8_t is = 0;
+        uint8_t it = 0;
+        uint8_t id = 0;
+        uint8_t lanes = 0;
+        int16_t immediate = 0;
+    };
+
     struct DecodedInstructionPair
     {
         uint32_t lower = 0;
         uint32_t upper = 0;
+        UpperInstruction upperOp{};
+        LowerInstruction lowerOp{};
+        // No I bit, VF shadowing or reserved encoding.
+        bool plain = false;
+        // E, D or T bit.
+        bool mayEnd = false;
+        bool readsFlags = false;
+        bool hasResourceWait = false;
         InstructionUsage lowerUsage{};
         InstructionUsage upperUsage{};
         bool iBit = false;
@@ -128,6 +160,15 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+        // Precomputed from the usages for the interlock check. A VF lane is bit
+        // reg * 4 + lane of a 128-bit set and a VI register is its own bit.
+        std::array<uint64_t, 2> vfReads{};
+        std::array<uint64_t, 2> vfWrites{};
+        uint16_t viReads = 0;
+        uint16_t viWrites = 0;
+        uint16_t viSlowWrites = 0; // the ones that take kFmacLatency
+        uint8_t firstViWrite = 0;
+        uint8_t maxWriteLatency = 0;
     };
 
     struct FlagPipelineEntry
@@ -138,7 +179,6 @@ private:
         uint32_t status = 0;
         uint32_t extraSticky = 0;
         uint32_t clip = 0;
-        bool valid = false;
         bool writesMac = false;
         bool writesStatus = false;
         bool writesSticky = false;
@@ -150,43 +190,6 @@ private:
         uint64_t readyCycle = 0;
         float value = 0.0f;
         uint32_t statusDi = 0;
-        bool valid = false;
-    };
-
-    struct PendingStore
-    {
-        uint64_t readyCycle = 0;
-        uint32_t address = 0;
-        std::array<uint32_t, 4> words{};
-        uint8_t laneMask = 0;
-        bool valid = false;
-    };
-
-    struct PendingVfWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        std::array<float, 4> value{};
-        uint8_t reg = 0;
-        uint8_t laneMask = 0;
-        bool valid = false;
-    };
-
-    struct PendingViWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        int32_t value = 0;
-        uint8_t reg = 0;
-        bool valid = false;
-    };
-
-    struct PendingAccWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        std::array<float, 4> value{};
-        uint8_t laneMask = 0;
         bool valid = false;
     };
 
@@ -207,10 +210,6 @@ private:
     static constexpr uint32_t kFmacLatency = 4u;
     static constexpr uint32_t kAccForwardLatency = 1u;
     static constexpr uint32_t kMaxFlagEntries = 8u;
-    static constexpr uint32_t kMaxPendingStores = 8u;
-    static constexpr uint32_t kMaxPendingVfWrites = 16u;
-    static constexpr uint32_t kMaxPendingViWrites = 8u;
-    static constexpr uint32_t kMaxPendingAccWrites = 8u;
     static constexpr uint32_t kMaxDecodedPairs = 0x4000u / 8u;
 
     Unit m_unit;
@@ -225,23 +224,45 @@ private:
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
-    std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
-    std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
-    std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
-    std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
     XgkickPipeline m_xgkick{};
-    std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
-    std::array<uint64_t, 16> m_viReady{};
-    std::array<uint64_t, 4> m_accReady{};
-    std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
-    std::array<uint64_t, 16> m_viLatestWrite{};
-    std::array<uint64_t, 4> m_accLatestWrite{};
+    // Only a write with the four-cycle latency can stall a later pair (one
+    // cycle has passed before the next can issue), and only for the three
+    // pairs after it. So the last three pairs' slow writes are the scoreboard.
+    struct IssuedWrites
+    {
+        std::array<uint64_t, 2> vf{};
+        uint64_t readyCycle = 0;
+        uint32_t vi = 0;
+    };
+    std::array<IssuedWrites, 3> m_issued{}; // newest first
 
     uint64_t m_cycle = 0;
-    uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
+    // Earliest readyCycle of any Q or P entry (max when none), so the per-cycle
+    // commit and pending checks don't scan every pipeline.
+    uint64_t m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
+    // Latest cycle at which an issued VF/VI/ACC write lands. The values are
+    // written back at issue (see run), but a program only ends once its
+    // writes would have committed.
+    uint64_t m_writebackHorizon = 0;
+    // Every flag write has the FMAC latency, so that pipeline is a FIFO. It is
+    // committed lazily: before an instruction that reads flags, when it fills
+    // up, and when the program stops.
+    uint32_t m_flagHead = 0;
+    uint32_t m_flagCount = 0;
+    // Occupied slots per pipeline (bit i = entry i valid); commits walk set
+    // bits in ascending slot order, the same order as a full array scan.
+    uint32_t m_efuMask = 0;
+    DecodedInstructionPair m_uncachedDecoded{};
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
+    // Normalized operands of the executing upper instruction (set by
+    // execUpper, read by normalizeFmacResult).
+    const float *m_fmacVs = nullptr;
+    const float *m_fmacVt = nullptr;
+    const float *m_fmacAcc = nullptr;
+    float m_fmacQ = 0.0f;
+    float m_fmacI = 0.0f;
     int32_t m_viBranchBackupValue = 0;
     uint8_t m_viBranchBackupReg = 0;
     bool m_viBranchBackupValid = false;
@@ -263,7 +284,7 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
@@ -273,24 +294,35 @@ private:
     void applyDestAcc(const float *result, uint8_t dest);
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
-    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
-    uint32_t calculateFmacProductSticky(uint8_t dest) const;
+    void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4], uint32_t &productSticky);
+    template <typename Real>
+    bool calculateFmacExactResult(uint32_t component, Real &result) const;
+    template <typename Real>
+    uint8_t normalizeFmacExactResult(float &value, Real exactResult) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
+    FlagPipelineEntry *pushFlags();
+    void commitFlags();
+    template <uint8_t Kind>
+    void execFmac(const UpperInstruction &op, uint32_t instruction);
+    void execUpperDecoded(const DecodedInstructionPair &decoded);
+    void execLowerDecoded(const DecodedInstructionPair &decoded, uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory);
     void queueFsset(uint16_t immediate);
     void queueClip(uint32_t clip);
     void queueFcset(uint32_t clip);
     void queueQ(float value, uint32_t latency, uint32_t statusDi);
     void queueP(float value, uint32_t latency);
-    void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
-    void queueVfWrite(uint8_t reg, uint8_t laneMask, const float value[4], uint32_t latency);
-    void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
-    void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
+    void storeWords(uint32_t address, const uint32_t words[4], uint8_t laneMask);
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
     void commitReadyPipelines();
+    void commitDuePipelines();
+    void noteReadyCycle(uint64_t readyCycle)
+    {
+        if (readyCycle < m_nextCommitCycle)
+            m_nextCommitCycle = readyCycle;
+    }
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
@@ -300,7 +332,19 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    // Denormals flush to signed zero; Inf/NaN clamp to the signed max.
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0xFFu)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;

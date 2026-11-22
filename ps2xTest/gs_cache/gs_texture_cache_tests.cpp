@@ -48,6 +48,20 @@ namespace
         }
     }
 
+    void multiPageVisibility()
+    {
+        BackendFixture f;
+        auto tex = texture(GS_PSM_CT32, 31);
+        f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kRed);
+        f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 8, 0, kGreen);
+        expectEqual(f.sample(tex), kRed, "prime the first physical page");
+        f.backend.WriteVram(tex.psm, tex.tbp0, tex.tbw, 0, 0, kBlue);
+        expectEqual(f.sample(tex, 8), kGreen, "prime the second physical page");
+        expectEqual(f.sample(tex), kRed, "sampling another page must not evict the first cached page");
+        f.backend.TextureFlush();
+        expectEqual(f.sample(tex), kBlue, "TEXFLUSH exposes changes across cached pages");
+    }
+
     void flushVisibility()
     {
         BackendFixture f;
@@ -169,6 +183,7 @@ int main(int argc, char** argv)
     return run(argc, argv, {
         {"unaligned_texture", unalignedTexture}, {"unaligned_wrap", unalignedWrap},
         {"stale_mirror", staleMirror}, {"page_alternation", pageAlternation},
+        {"multi_page_visibility", multiPageVisibility},
         {"flush_visibility", flushVisibility}, {"upload_visibility", uploadVisibility},
         {"local_copy_visibility", localCopyVisibility}, {"raster_visibility", rasterVisibility},
         {"reset_and_rebind", resetAndRebind}, {"invalid_vram_size", invalidVramSize},

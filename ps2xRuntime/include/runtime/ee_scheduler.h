@@ -426,6 +426,10 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint32_t m_cop0Count = 0;
+    // The context whose cop0_count equals m_cop0Count plus any MTC0 since.
+    const R5900Context *m_cop0SyncedContext = nullptr;
+    GuestThread *m_cachedThread = nullptr;
+    int m_cachedThreadId = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

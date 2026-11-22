@@ -240,8 +240,8 @@ void register_ps2_vu1_tests()
 
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
 
-            t.Equals(vu1.state().vf[3][0], -1.0f,
-                     "FMAC destination must remain hidden before its four-cycle writeback");
+            t.Equals(vu1.state().vf[3][0], 11.0f,
+                     "interlocked FMAC destinations may be stored before their ready cycle");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
                        fx.gs, &fx.mem, 0u, 0u, 3u);
             t.Equals(vu1.state().vf[3][0], 11.0f, "ADD.x should write x");
@@ -270,8 +270,8 @@ void register_ps2_vu1_tests()
 
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 1u);
 
-            t.Equals(vu1.state().vf[2][0], 0.0f,
-                     "ADDi result should remain in the FMAC pipeline");
+            t.Equals(vu1.state().vf[2][0], 3.0f,
+                     "interlocked ADDi results may be stored before their ready cycle");
             t.Equals(vu1.state().i, 7.0f,
                      "LOI should become visible after the upper from the same pair");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
@@ -364,8 +364,8 @@ void register_ps2_vu1_tests()
 
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 3u);
 
-            t.Equals(vu1.state().vf[4][1], 200.0f,
-                     "LQ result should remain hidden before its fourth cycle");
+            t.Equals(vu1.state().vf[4][1], 20.0f,
+                     "interlocked LQ results may be stored before their ready cycle");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE,
                        fx.gs, &fx.mem, 0u, 0u, 1u);
             t.Equals(vu1.state().vf[4][0], 100.0f, "LQ.yw should preserve x");
@@ -503,8 +503,8 @@ void register_ps2_vu1_tests()
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                         0u, 0u, 0u, 1u);
 
-            t.Equals(vu1.state().vf[1][0], 1.0f,
-                     "upper write should remain pending until the FMAC writeback cycle");
+            t.Equals(vu1.state().vf[1][0], 110.0f,
+                     "the winning interlocked upper write may be stored before its ready cycle");
             t.Equals(vu1.state().vi[1], 6,
                      "LQI post-increment should commit after one cycle");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
@@ -568,8 +568,8 @@ void register_ps2_vu1_tests()
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                         0u, 0u, 0u, 5u);
 
-            t.Equals(vu1.state().vf[4][0], 0.0f,
-                     "the dependent result should remain pending until its own writeback");
+            t.Equals(vu1.state().vf[4][0], 5.0f,
+                     "the dependent result may be stored before its own ready cycle");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                        0u, 0u, 3u);
@@ -754,8 +754,10 @@ void register_ps2_vu1_tests()
 
             t.Equals(vu1.state().p, 14.0f,
                      "WAITP should expose ESADD after eleven cycles");
-            t.Equals(vu1.state().vf[3][0], 0.0f,
-                     "RNEXT vector result should respect FMAC writeback latency");
+            t.IsTrue(vu1.state().vf[3][0] >= 1.0f &&
+                         vu1.state().vf[3][0] < 2.0f &&
+                         vu1.state().vf[3][0] != 1.5f,
+                     "RNEXT should store its interlocked result before the ready cycle");
             vu1.resume(fx.code, PS2_VU1_CODE_SIZE,
                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                        0u, 0u, 3u);

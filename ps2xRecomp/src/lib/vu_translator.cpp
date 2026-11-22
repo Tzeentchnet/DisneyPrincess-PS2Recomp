@@ -11,12 +11,105 @@
 
 namespace ps2recomp
 {
+    namespace
+    {
+        struct MacroEffects
+        {
+            bool updatesMac = false;
+            bool writesAcc = false;
+            int vfDestination = -1;
+        };
+
+        MacroEffects macroEffects(const Instruction &inst)
+        {
+            MacroEffects effects;
+            if (inst.rs == COP2_QMTC2)
+            {
+                effects.vfDestination = inst.rd;
+                return effects;
+            }
+            if (inst.rs < COP2_CO)
+                return effects;
+
+            const uint32_t function = inst.function & 0x3Fu;
+            if (function < 0x30u)
+            {
+                effects.vfDestination = inst.sa;
+                const bool minMax = (function >= 0x10u && function <= 0x17u) || function == 0x1Du ||
+                                    function == 0x1Fu || function == 0x2Bu || function == 0x2Fu;
+                effects.updatesMac = !minMax;
+                return effects;
+            }
+            if (function < 0x3Cu)
+                return effects;
+
+            const uint32_t special = (((inst.raw >> 6) & 0x1Fu) << 2) | (inst.raw & 0x3u);
+            switch (special)
+            {
+            case VU0_S2_VITOF0:
+            case VU0_S2_VITOF4:
+            case VU0_S2_VITOF12:
+            case VU0_S2_VITOF15:
+            case VU0_S2_VFTOI0:
+            case VU0_S2_VFTOI4:
+            case VU0_S2_VFTOI12:
+            case VU0_S2_VFTOI15:
+            case VU0_S2_VABS:
+            case VU0_S2_VMOVE:
+            case VU0_S2_VMR32:
+            case VU0_S2_VLQI:
+            case VU0_S2_VLQD:
+            case VU0_S2_VMFIR:
+            case VU0_S2_VRGET:
+            case VU0_S2_VRNEXT:
+                effects.vfDestination = inst.rt;
+                break;
+            default:
+                effects.writesAcc = special <= 0x0Fu || (special >= 0x18u && special <= 0x1Cu) ||
+                                    special == 0x1Eu || (special >= 0x20u && special <= 0x2Au) ||
+                                    (special >= 0x2Cu && special <= 0x2Eu);
+                effects.updatesMac = effects.writesAcc;
+                break;
+            }
+            return effects;
+        }
+    }
+
     VuTranslator::VuTranslator(CodeGenerator &codeGenerator)
         : m_codeGenerator(codeGenerator)
     {
     }
 
     std::string VuTranslator::translate(const Instruction &inst)
+    {
+        const std::string operation = translateOperation(inst);
+        const MacroEffects effects = macroEffects(inst);
+        // VF0 is hardwired. Games still name it as a destination when they only
+        // want the flags, as in VSUB vf0, a, b followed by CFC2 of MAC.
+        const bool discards = effects.vfDestination == 0;
+        if (!discards && !effects.updatesMac)
+            return operation;
+
+        std::string code;
+        if (effects.updatesMac)
+        {
+            const uint32_t dest = inst.vectorInfo.vectorField;
+            const uint32_t lanes = ((dest & 8u) >> 3) | ((dest & 4u) >> 1) | ((dest & 2u) << 1) | ((dest & 1u) << 3);
+            const std::string result = effects.writesAcc ? std::string("ctx->vu0_acc")
+                                                         : fmt::format("ctx->vu0_vf[{}]", effects.vfDestination);
+            code = fmt::format("{} ps2_vu0_update_mac(ctx, {}, 0x{:X});", operation, result, lanes);
+        }
+        else
+        {
+            code = operation;
+        }
+
+        if (discards)
+            return fmt::format("{{ const __m128 hardwiredVf0 = ctx->vu0_vf[0]; {} ctx->vu0_vf[0] = hardwiredVf0; }}", code);
+        return fmt::format("{{ {} }}", code);
+    }
+
+    std::string VuTranslator::translateOperation(const Instruction &inst)
     {
         uint8_t format = inst.rs; // Use parsed rs field for COP2 format
         uint8_t rt = inst.rt;
@@ -268,15 +361,15 @@ namespace ps2recomp
 
                     return fmt::format(
                         "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
+                        "__m128 ft = _mm_and_ps(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
                         "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
                         "__m128 gt = _mm_cmpgt_ps(fs, ft); "
                         "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
                         "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
                         "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+                        "uint32_t flags = ((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1) | "
+                        "((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2) | "
+                        "((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3); "
                         "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
                 }

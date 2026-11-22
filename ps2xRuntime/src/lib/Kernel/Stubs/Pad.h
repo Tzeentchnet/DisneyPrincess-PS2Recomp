@@ -76,6 +76,8 @@ namespace ps2_stubs
     };
 
     PadDebugSnapshot getPadDebugSnapshot();
+    uint16_t applyAutoStartPulse(uint16_t buttons, uint32_t readCount, uint32_t firstRead,
+                                 uint32_t periodReads = 16u);
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
     void clearPadOverrideState();
 }

@@ -2,6 +2,8 @@
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_memory.h"
 
 #include <algorithm>
 #include <cassert>
@@ -88,6 +90,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_rdram = rdram;
     m_readyQueues = {};
     m_threads.clear();
+    m_cachedThread = nullptr;
+    m_cachedThreadId = 0;
     m_semaphores.clear();
     m_eventFlags.clear();
     m_alarms.clear();
@@ -112,6 +116,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_cop0Count = mainContext.cop0_count;
+    m_cop0SyncedContext = nullptr;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -174,6 +179,8 @@ void EeScheduler::run()
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
+                if (!m_runtime.memory().isVif1Busy()) // the worker submits when it finishes
+                    m_runtime.gs().submitPendingHostWork();
                 waitForEvent();
                 continue;
             }
@@ -394,18 +401,31 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-    if (const R5900Context *context = currentContext())
+    if (R5900Context *context = currentContext())
     {
-        m_cop0Count = context->cop0_count;
-    }
-    m_cop0Count += static_cast<uint32_t>(elapsed);
-    for (auto &[id, thread] : m_threads)
-    {
-        (void)id;
-        thread.context.cop0_count = m_cop0Count;
-        for (GuestInvocation &invocation : thread.invocations)
+        // This runs on every guest call, so only the executing context is
+        // updated. Any other one is stale until it becomes current, and its
+        // Count must not be read back as if the guest had written it.
+        if (context == m_cop0SyncedContext)
         {
-            invocation.context.cop0_count = m_cop0Count;
+            m_cop0Count = context->cop0_count;
+        }
+        m_cop0Count += static_cast<uint32_t>(elapsed);
+        context->cop0_count = m_cop0Count;
+        m_cop0SyncedContext = context;
+    }
+    else
+    {
+        m_cop0SyncedContext = nullptr;
+        m_cop0Count += static_cast<uint32_t>(elapsed);
+        for (auto &[id, thread] : m_threads)
+        {
+            (void)id;
+            thread.context.cop0_count = m_cop0Count;
+            for (GuestInvocation &invocation : thread.invocations)
+            {
+                invocation.context.cop0_count = m_cop0Count;
+            }
         }
     }
     m_eeCycle += elapsed;
@@ -488,6 +508,8 @@ int EeScheduler::deleteThread(int id, uint32_t &ownedStack)
     {
         ownedStack = it->second.stack;
     }
+    m_cachedThread = nullptr;
+    m_cop0SyncedContext = nullptr;
     m_threads.erase(it);
     publishSnapshot();
     return KE_OK;
@@ -536,6 +558,8 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     m_currentThreadId = 0;
     if (deleteThreadRecord && id != kMainThreadId)
     {
+        m_cachedThread = nullptr;
+        m_cop0SyncedContext = nullptr;
         m_threads.erase(id);
     }
     if (ownedStack != 0u)
@@ -1450,7 +1474,13 @@ const EeEventFlag *EeScheduler::eventFlag(int id) const
 
 GuestThread *EeScheduler::currentThread()
 {
-    return thread(m_currentThreadId);
+    // unordered_map nodes are stable, so this stays valid until an erase.
+    if (!m_cachedThread || m_cachedThreadId != m_currentThreadId)
+    {
+        m_cachedThread = thread(m_currentThreadId);
+        m_cachedThreadId = m_currentThreadId;
+    }
+    return m_cachedThread;
 }
 
 const GuestThread *EeScheduler::currentThread() const
@@ -1867,6 +1897,11 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // After falling well behind, restart pacing from now; otherwise
+                // the guest fast-forwards until the backlog is paid off.
+                const auto hostNow = std::chrono::steady_clock::now();
+                if (hostNow - scheduled.hostDeadline > kVBlankPeriod * 4)
+                    scheduled.hostDeadline = hostNow;
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
@@ -1888,6 +1923,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        if (!m_runtime.memory().isVif1Busy()) // the worker submits when it finishes
+            m_runtime.gs().submitPendingHostWork();
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {

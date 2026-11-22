@@ -311,6 +311,61 @@ inline float ps2_frsqrt(float a, float b)
     return ps2_fall_normal(a, b, r) ? r : ps2_frsqrt_slow(a, b);
 }
 
+inline uint32_t ps2_fcanonical_compare_bits(float value)
+{
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    return (bits & PS2_FLOAT_EXP_MASK) == 0u ? (bits & PS2_FLOAT_SIGN_MASK) : bits;
+}
+
+inline bool ps2_feq(float a, float b)
+{
+    const uint32_t ua = ps2_fcanonical_compare_bits(a);
+    const uint32_t ub = ps2_fcanonical_compare_bits(b);
+    return ua == ub || ((ua | ub) & ~PS2_FLOAT_SIGN_MASK) == 0u;
+}
+
+inline bool ps2_flt(float a, float b)
+{
+    const uint32_t ua = ps2_fcanonical_compare_bits(a);
+    const uint32_t ub = ps2_fcanonical_compare_bits(b);
+    if (ua == ub || ((ua | ub) & ~PS2_FLOAT_SIGN_MASK) == 0u)
+        return false;
+
+    const bool aNegative = (ua & PS2_FLOAT_SIGN_MASK) != 0u;
+    const bool bNegative = (ub & PS2_FLOAT_SIGN_MASK) != 0u;
+    if (aNegative != bNegative)
+        return aNegative;
+
+    const uint32_t aMagnitude = ua & ~PS2_FLOAT_SIGN_MASK;
+    const uint32_t bMagnitude = ub & ~PS2_FLOAT_SIGN_MASK;
+    return aNegative ? aMagnitude > bMagnitude : aMagnitude < bMagnitude;
+}
+
+inline bool ps2_fle(float a, float b)
+{
+    return ps2_feq(a, b) || ps2_flt(a, b);
+}
+
+inline float ps2_fmax(float a, float b)
+{
+    return ps2_flt(a, b) ? b : a;
+}
+
+inline float ps2_fmin(float a, float b)
+{
+    return ps2_flt(b, a) ? b : a;
+}
+
+// CVT.W.S always truncates on the R5900, whatever FCR31 says, and saturates
+// where the host conversion would return INT_MIN.
+inline int32_t ps2_fcvt_w(float value)
+{
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    if ((bits & ~PS2_FLOAT_SIGN_MASK) < 0x4F000000u)
+        return static_cast<int32_t>(value);
+    return (bits & PS2_FLOAT_SIGN_MASK) != 0u ? static_cast<int32_t>(0x80000000u) : 0x7FFFFFFF;
+}
+
 enum class Ps2VecOp
 {
     Add,
@@ -367,6 +422,32 @@ inline __m128 ps2_vsub(__m128 a, __m128 b)
 inline __m128 ps2_vmul(__m128 a, __m128 b)
 {
     return ps2_vfinish(a, b, _mm_mul_ps(a, b), Ps2VecOp::Mul);
+}
+
+// VFTOI saturates; CVTTPS2DQ returns INT_MIN for every out-of-range lane.
+inline __m128 ps2_vftoi(__m128 value, float scale)
+{
+    const __m128 scaled = _mm_mul_ps(value, _mm_set1_ps(scale));
+    const __m128i tooLarge = _mm_cmpgt_epi32(_mm_castps_si128(scaled), _mm_set1_epi32(0x4EFFFFFF));
+    return _mm_castsi128_ps(_mm_xor_si128(_mm_cvttps_epi32(scaled), tooLarge));
+}
+
+// MAC and STATUS after a VU0 macro FMAC operation. laneMask has bit 0 = x,
+// the order movemask uses; the MAC nibbles have bit 3 = x.
+inline void ps2_vu0_update_mac(R5900Context *ctx, __m128 result, int laneMask)
+{
+    constexpr uint8_t reversed[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    const __m128i magnitude = _mm_and_si128(_mm_castps_si128(result), _mm_set1_epi32(0x7FFFFFFF));
+    const int zero = laneMask & _mm_movemask_ps(_mm_castsi128_ps(
+        _mm_cmpgt_epi32(_mm_set1_epi32(0x00800000), magnitude)));
+    const int negative = laneMask & _mm_movemask_ps(result);
+    const int overflow = laneMask & _mm_movemask_ps(_mm_castsi128_ps(
+        _mm_cmpeq_epi32(magnitude, _mm_set1_epi32(0x7FFFFFFF))));
+    ctx->vu0_mac_flags = static_cast<uint32_t>(reversed[zero]) |
+                         (static_cast<uint32_t>(reversed[negative]) << 4) |
+                         (static_cast<uint32_t>(reversed[overflow]) << 12);
+    const uint32_t current = (zero ? 1u : 0u) | (negative ? 2u : 0u) | (overflow ? 8u : 0u);
+    ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0xFF0u) | current | (current << 6));
 }
 
 // PS2 VU (Vector Unit) operations
@@ -859,24 +940,24 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2_fcvt_w((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) ps2_feq((float)(a), (float)(b))
+#define FPU_C_UEQ_S(a, b) ps2_feq((float)(a), (float)(b))
+#define FPU_C_OLT_S(a, b) ps2_flt((float)(a), (float)(b))
+#define FPU_C_ULT_S(a, b) ps2_flt((float)(a), (float)(b))
+#define FPU_C_OLE_S(a, b) ps2_fle((float)(a), (float)(b))
+#define FPU_C_ULE_S(a, b) ps2_fle((float)(a), (float)(b))
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) ps2_feq((float)(a), (float)(b))
+#define FPU_C_NGL_S(a, b) ps2_feq((float)(a), (float)(b))
+#define FPU_C_LT_S(a, b) ps2_flt((float)(a), (float)(b))
+#define FPU_C_NGE_S(a, b) ps2_flt((float)(a), (float)(b))
+#define FPU_C_LE_S(a, b) ps2_fle((float)(a), (float)(b))
+#define FPU_C_NGT_S(a, b) ps2_fle((float)(a), (float)(b))
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.

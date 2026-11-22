@@ -6,6 +6,7 @@
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_stdio.h"
 #include "emulator/imports/iop_timrman.h"
+#include "emulator/imports/iop_vblank.h"
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
 
@@ -278,6 +279,69 @@ namespace
         return passed;
     }
 
+    bool testVblankHandler()
+    {
+        IopMemory memory;
+        IopKernel kernel(memory);
+        IopVblank vblank(kernel);
+        IopCpuState cpu{};
+        cpu.gpr[4] = 0u; // vblank start
+        cpu.gpr[5] = 0x10u;
+        cpu.gpr[6] = 0x12340u;
+        cpu.gpr[7] = 0x45670u;
+        cpu.gpr[28] = 0x89AB0u;
+        if (!expect(vblank.dispatchImport(8u, cpu, 100u) && cpu.gpr[2] == 0u, "RegisterVblankHandler failed"))
+            return false;
+
+        const uint64_t first = vblank.nextEventCycle(UINT64_MAX);
+        RecordingExecutor executor;
+        executor.callbackResult = 1u;
+        vblank.serviceDue(first - 1u, executor);
+        if (!expect(executor.calls == 0u, "vblank handler ran early"))
+            return false;
+        vblank.serviceDue(first, executor);
+        if (!expect(executor.calls == 1u && executor.lastArgument == 0x45670u && executor.lastGp == 0x89AB0u,
+                    "vblank handler was not delivered") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) > first, "vblank handler was not rearmed"))
+            return false;
+
+        executor.callbackResult = 0u; // a handler returning zero unregisters itself
+        vblank.serviceDue(vblank.nextEventCycle(UINT64_MAX), executor);
+        return expect(vblank.nextEventCycle(UINT64_MAX) == UINT64_MAX, "zero return should unregister the handler");
+    }
+
+    bool testSpu2VoiceCursor()
+    {
+        IopMemory memory;
+        uint64_t cycles = 0u;
+        memory.setClock(&cycles);
+        constexpr uint32_t spu = IopSpu2::Base;
+
+        // Two ADPCM blocks at word 0x100: a loop start, then end and repeat.
+        memory.write16(spu + 0x1A8u, 0u);
+        memory.write16(spu + 0x1AAu, 0x100u);
+        for (uint32_t word = 0u; word < 16u; ++word)
+            memory.write16(spu + 0x1ACu, word == 0u ? 0x0400u : (word == 8u ? 0x0300u : 0u));
+
+        memory.write16(spu + 0x004u, 0x1000u); // voice 0 at 48 kHz
+        memory.write16(spu + 0x1C0u, 0u);      // SSA
+        memory.write16(spu + 0x1C2u, 0x100u);
+        memory.write16(spu + 0x1A0u, 1u);      // key on
+
+        cycles = 28u * IopSpu2::IopCyclesPerSample;
+        if (!expect(memory.read16(spu + 0x1CAu) == 0x109u, "NAX did not move to the second block") ||
+            !expect(memory.read16(spu + 0x00Au) != 0u, "ENVX should show a playing voice"))
+            return false;
+
+        cycles *= 2u;
+        if (!expect(memory.read16(spu + 0x1CAu) == 0x101u, "the voice did not loop") ||
+            !expect((memory.read16(spu + 0x340u) & 1u) != 0u, "ENDX was not set at the loop end"))
+            return false;
+
+        memory.write16(spu + 0x1A4u, 1u); // key off
+        return expect(memory.read16(spu + 0x00Au) == 0u, "key off should release the voice");
+    }
+
     bool testTimrmanPeriodicCallback()
     {
         IopTimrman timrman;
@@ -393,7 +457,8 @@ namespace
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback() || !testStdioPrintfFormatting() ||
+        !testTimrmanPeriodicCallback() || !testVblankHandler() || !testSpu2VoiceCursor() ||
+        !testStdioPrintfFormatting() ||
         !testDetachedSemaphoreWaitFailsExplicitly())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";

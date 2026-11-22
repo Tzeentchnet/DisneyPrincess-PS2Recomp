@@ -1,4 +1,7 @@
 #include "Common.h"
+#include "runtime/ps2_audio.h"
+#include "runtime/ps2_rom_device.h"
+#include "runtime/ps2_vfs.h"
 #include "FileIO.h"
 
 namespace ps2_syscalls

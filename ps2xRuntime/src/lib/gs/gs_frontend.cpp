@@ -14,6 +14,23 @@ namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
 
+    struct ScopedBoolValue
+    {
+        bool &target;
+        bool previous;
+
+        ScopedBoolValue(bool &target_, bool value)
+            : target(target_), previous(target_)
+        {
+            target = value;
+        }
+
+        ~ScopedBoolValue()
+        {
+            target = previous;
+        }
+    };
+
     GSPrimReg decodePrimRegister(uint64_t value)
     {
         GSPrimReg prim{};
@@ -168,6 +185,7 @@ void GS::reset()
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame.clear();
+        m_hostPresentationGpuFrame.reset();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
         m_hostPresentationDisplayFbp = 0u;
@@ -260,6 +278,8 @@ GSDebugSnapshot GS::getDebugSnapshot() const
         snapshot.hasHostPresentationFrame = m_hasHostPresentationFrame;
     }
     snapshot.localToHostPendingBytes = transfer.localToHostPendingBytes;
+    if (m_backend && m_backend->UsesRawCommands())
+        m_backend->ReadRegisterState(snapshot);
     return snapshot;
 }
 
@@ -509,6 +529,9 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     if (!m_privRegs)
         return request;
     request.pmode = m_privRegs->pmode;
+    request.smode1 = m_privRegs->smode1;
+    request.syncv = m_privRegs->syncv;
+    request.field = (m_privRegs->csr.load() >> 13u) & 1u;
     request.smode2 = m_privRegs->smode2;
     request.dispfb1 = m_privRegs->dispfb1;
     request.display1 = m_privRegs->display1;
@@ -533,6 +556,7 @@ void GS::latchHostPresentationFrame()
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
+            m_hostPresentationGpuFrame.reset();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
@@ -560,6 +584,8 @@ void GS::latchHostPresentationFrame()
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationGpuFrame = std::move(frame.gpu);
+        m_hostPresentationAspectRatio = frame.aspectRatio;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -638,13 +664,28 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    const bool mirrorRawCommands =
+        m_backend && m_backend->UsesRawCommands() && !m_mirroringRawCommands;
+    if (mirrorRawCommands)
+    {
+        if (data && sizeBytes && (sizeBytes & 15u) == 0u)
+        {
+            m_backend->ProcessGIF(path, data, sizeBytes);
+            m_hostWorkPending = true;
+        }
+        if (m_debugHistoryPaused)
+            return;
+    }
+    ScopedBoolValue mirrorGuard(
+        m_mirroringRawCommands, m_mirroringRawCommands || mirrorRawCommands);
+
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    if (!m_mirroringRawCommands && tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -745,6 +786,21 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+
+    const bool mirrorRawCommands =
+        m_backend->UsesRawCommands() && !m_mirroringRawCommands;
+    if (mirrorRawCommands)
+    {
+        m_backend->ProcessGIF(3, data, sizeBytes);
+        m_hostWorkPending = true;
+        if (m_debugHistoryPaused)
+        {
+            ++m_nativePackedGIFPacketCount;
+            return true;
+        }
+    }
+    ScopedBoolValue mirrorGuard(
+        m_mirroringRawCommands, m_mirroringRawCommands || mirrorRawCommands);
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -1068,6 +1124,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (m_backend && m_backend->UsesRawCommands() && !m_mirroringRawCommands)
+    {
+        m_backend->WriteRegisterRaw(regAddr, value);
+        m_hostWorkPending = true;
+        return;
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1240,7 +1302,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (!m_mirroringRawCommands)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1271,7 +1334,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (!m_mirroringRawCommands)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:
@@ -1385,7 +1449,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
 
-        if (m_backend)
+        if (m_backend && !m_mirroringRawCommands)
         {
             GSTransferCommand command{};
             command.bitbltbuf = m_bitbltbuf;
@@ -1399,9 +1463,12 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_HWREG:
     {
-        uint8_t buf[8];
-        std::memcpy(buf, &value, 8);
-        processImageData(buf, 8);
+        if (!m_mirroringRawCommands)
+        {
+            uint8_t buf[8];
+            std::memcpy(buf, &value, 8);
+            processImageData(buf, 8);
+        }
         break;
     }
     case GS_REG_PABE:
@@ -1413,7 +1480,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_fogB = static_cast<uint8_t>((value >> 16) & 0xFFu);
         break;
     case GS_REG_TEXFLUSH:
-        if (m_backend)
+        if (m_backend && !m_mirroringRawCommands)
             m_backend->TextureFlush();
         break;
     case GS_REG_SCANMSK:
@@ -1464,7 +1531,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
-        if (m_privRegs)
+        if (m_privRegs && !m_mirroringRawCommands)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
             uint32_t mask = static_cast<uint32_t>(value >> 32);
@@ -1477,18 +1544,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_FINISH:
     {
-        if (m_backend)
+        if (m_backend && !m_mirroringRawCommands)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
-        if (m_privRegs)
+        if (m_privRegs && !m_mirroringRawCommands)
             m_privRegs->csr.fetch_or(0x2);
         break;
     }
     case GS_REG_LABEL:
     {
-        if (m_privRegs)
+        if (m_privRegs && !m_mirroringRawCommands)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
             uint32_t mask = static_cast<uint32_t>(value >> 32);
@@ -1500,7 +1567,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case 0x59:
         if (m_privRegs)
-            m_privRegs->dispfb1 = value;
+            m_privRegs->writeDisplayFramebuffer(0, value);
         break;
     case 0x5a:
         if (m_privRegs)
@@ -1508,7 +1575,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5b:
         if (m_privRegs)
-            m_privRegs->dispfb2 = value;
+            m_privRegs->writeDisplayFramebuffer(1, value);
         break;
     case 0x5c:
         if (m_privRegs)
@@ -1577,7 +1644,8 @@ void GS::vertexKick(bool drawing)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        if (!m_mirroringRawCommands)
+            m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1610,21 +1678,34 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
-    if (m_backend)
+    if (m_backend && !m_mirroringRawCommands)
+    {
         m_backend->UploadImage(data, sizeBytes);
+        m_hostWorkPending = true;
+    }
+}
+
+void GS::submitPendingHostWork()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (!m_hostWorkPending || !m_backend || !m_backend->UsesRawCommands())
+        return;
+    m_hostWorkPending = false;
+    m_backend->Flush();
 }
 
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+    return m_backend && m_backend->ClearFramebuffer(getDebugSnapshot().ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+    const auto state = getDebugSnapshot();
+    return m_backend && m_backend->ClearFramebuffer(state.ctx[state.prim.ctxt ? 1 : 0], rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
@@ -1733,4 +1814,32 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
     }
+}
+
+std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hostPresentationGpuFrame)
+        return {};
+    width = m_hostPresentationWidth;
+    height = m_hostPresentationHeight;
+    aspectRatio = m_hostPresentationAspectRatio;
+    return m_hostPresentationGpuFrame;
+}
+
+void GS::shutdownBackend()
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+    m_hostPresentationGpuFrame.reset();
+    m_hostPresentationFrame.clear();
+    m_hasHostPresentationFrame = false;
+    m_backend.reset();
+}
+
+uint64_t GS::getReadbackCount() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    return m_backend ? m_backend->GetReadbackCount() : 0;
 }

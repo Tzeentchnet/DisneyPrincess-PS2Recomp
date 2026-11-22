@@ -2,7 +2,12 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_log.h"
+#include "ps2_host_backend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_memory.h"
+#include "runtime/ps2_vfs.h"
+#include "ps2x/iop/iop_types.h"
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
@@ -2206,7 +2211,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    if (PS2HostKeyPressed(PS2HostKey::F1))
     {
         toggleVisible();
     }

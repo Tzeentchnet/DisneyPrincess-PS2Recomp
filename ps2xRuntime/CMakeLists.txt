@@ -5,6 +5,16 @@ project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(PS2X_GS_BACKEND "CPU" CACHE STRING "GS backend: CPU or PARALLEL_GS")
+set_property(CACHE PS2X_GS_BACKEND PROPERTY STRINGS CPU PARALLEL_GS)
+if(NOT PS2X_GS_BACKEND MATCHES "^(CPU|PARALLEL_GS)$")
+    message(FATAL_ERROR "PS2X_GS_BACKEND must be CPU or PARALLEL_GS")
+endif()
+if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS" AND
+   (ANDROID OR NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")))
+    message(FATAL_ERROR "PARALLEL_GS is supported only on Windows and Linux desktop")
+endif()
+
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
@@ -380,6 +390,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
+    src/lib/ps2_host_backend.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
@@ -395,6 +406,11 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")
+    message(STATUS "Using ParallelGS backend for PS2 graphics")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")
+endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -472,20 +488,6 @@ endif()
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
-    )
-
-    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
-        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
-            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
-        endif()
-    endforeach()
-
-    list(APPEND PS2X_RUNNER_PCH_HEADERS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_stubs.h"
     )
 
     target_precompile_headers(ps2EntryRunner PRIVATE ${PS2X_RUNNER_PCH_HEADERS})

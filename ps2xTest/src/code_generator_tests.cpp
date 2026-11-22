@@ -1,5 +1,7 @@
 #include "MiniTest.h"
 #include "ps2recomp/code_generator.h"
+#include "ps2recomp/Translators/vu_translator.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
 #include "ps2recomp/types.h"
@@ -175,23 +177,44 @@ void register_code_generator_tests()
 {
     MiniTest::Case("CodeGenerator", [](TestCase &tc)
                    {
-    tc.Run("Generated sources cannot be shadowed by stale local declaration headers", [](TestCase &t) {
+    tc.Run("Generated function sources avoid global declaration dependencies", [](TestCase &t) {
         Function func;
         func.name = "header_lookup";
         func.start = 0x8F00;
-        func.end = 0x8F04;
+        func.end = 0x8F08;
         func.isRecompiled = true;
 
-        CodeGenerator gen({}, {});
-        gen.setRenamedFunctions({{func.start, "header_lookup_0x8f00"}});
+        Instruction tailJump{};
+        tailJump.address = func.start;
+        tailJump.opcode = OPCODE_J;
+        tailJump.target = (0x9000u >> 2) & 0x3FFFFFFu;
+        tailJump.hasDelaySlot = true;
+        tailJump.raw = (OPCODE_J << 26) | tailJump.target;
 
-        const std::string generated = gen.generateFunction(func, {makeNop(func.start)}, true);
+        CodeGenerator gen({}, {});
+        gen.setRenamedFunctions({
+            {func.start, "header_lookup_0x8f00"},
+            {0x9000u, "tail_target_0x9000"}
+        });
+
+        const std::string generated =
+            gen.generateFunction(func, {tailJump, makeNop(func.start + 4u)}, true);
         const std::string registration = gen.generateFunctionRegistration({func}, {});
 
-        t.IsTrue(generated.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
-                 "function sources must resolve declarations through the configured include path");
-        t.IsTrue(generated.find("#include <ps2_recompiled_stubs.h>") != std::string::npos,
-                 "function sources must resolve stub declarations through the configured include path");
+        t.IsTrue(generated.find("ps2_recompiled_functions.h") == std::string::npos,
+                 "function sources should not depend on the global function declaration header");
+        t.IsTrue(generated.find("ps2_recompiled_stubs.h") == std::string::npos,
+                 "function sources should not depend on the global stub declaration header");
+        t.IsTrue(generated.find("ps2_syscalls.h") == std::string::npos,
+                 "ordinary function sources should not depend on syscall declarations");
+        t.IsTrue(generated.find("ps2_stubs.h") == std::string::npos,
+                 "ordinary function sources should not depend on stub declarations");
+        t.IsTrue(generated.find(
+                     "void tail_target_0x9000(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);") !=
+                     std::string::npos,
+                 "standalone function sources should declare only their direct generated callees");
+        t.IsTrue(generated.find("tail_target_0x9000(rdram, ctx, runtime); return;") != std::string::npos,
+                 "the direct tail jump should use its local callee declaration");
         t.IsTrue(registration.find("#include <ps2_recompiled_functions.h>") != std::string::npos,
                  "the registration source must use the same unambiguous declaration header");
         t.IsTrue(registration.find("#include <ps2_recompiled_stubs.h>") != std::string::npos,
@@ -1387,6 +1410,20 @@ void register_code_generator_tests()
                 const std::string out = gen.translateInstruction(inst);
                 t.IsTrue(out.find(expected) != std::string::npos, expected + " should be emitted for sa 31");
             }
+        });
+
+        tc.Run("VU0 compare through VF0 keeps the constant and sets MAC", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+            VuTranslator translator(gen);
+            // vsub.xyzw vf0, vf1, vf2
+            const std::string compare = translator.translate(decoder.decodeInstruction(0x1000, 0x4BE2082Cu));
+            t.IsTrue(compare.find("ctx->vu0_vf[0] = hardwiredVf0") != std::string::npos, "VF0 must be restored");
+            t.IsTrue(compare.find("ps2_vu0_update_mac(ctx, ctx->vu0_vf[0], 0xF)") != std::string::npos, "MAC must be set from the discarded result");
+            // vcallmsr vi27
+            const std::string call = translator.translate(decoder.decodeInstruction(0x1000, 0x4A00D839u));
+            t.IsTrue(call.find("ctx->vu0_cmsar0") != std::string::npos, "VCALLMSR must use CMSAR0");
+            t.IsTrue(call.find("ctx->vi[27]") == std::string::npos, "VCALLMSR must not index past VI15");
         });
 
         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {

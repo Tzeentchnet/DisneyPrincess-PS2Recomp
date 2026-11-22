@@ -5,6 +5,7 @@
 #include <map>
 #include <iostream>
 #include <exception>
+#include <cstdlib>
 
 class TestCase;
 using TestRunnerCallback = std::function<void(TestCase&)>;
@@ -124,11 +125,17 @@ public:
     {
         int failedCount = 0;
         int totalTests = 0;
+        const char* suiteFilter = std::getenv("MINITEST_SUITE_FILTER");
+        const char* testFilter = std::getenv("MINITEST_TEST_FILTER");
 
         for (auto& c : m_cases)
         {
             const std::string& suiteName = c.first;
             const TestCaseCallback& suiteCallback = c.second;
+            if (suiteFilter && suiteName.find(suiteFilter) == std::string::npos)
+            {
+                continue;
+            }
 
             std::cout << "\n[Suite]: " << suiteName << std::endl;
 
@@ -144,6 +151,10 @@ public:
             {
                 const std::string& testName = cc.first;
                 const TestRunnerCallback& testFn = cc.second;
+                if (testFilter && testName.find(testFilter) == std::string::npos)
+                {
+                    continue;
+                }
 
                 totalTests++;
                 testCase.ClearFailures();

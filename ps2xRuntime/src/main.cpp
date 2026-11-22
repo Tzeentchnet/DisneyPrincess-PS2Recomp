@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <exception>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 
 #if defined(__ANDROID__)
@@ -168,6 +169,10 @@ int main(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
+#elif !defined(PLATFORM_VITA)
+    // Redirected stdout is block buffered, so a killed run used to lose its
+    // last lines and look as if it had stopped early in boot.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
 #endif
     setupTerminateLogger();
 

@@ -1,13 +1,12 @@
 #ifndef PS2_SYSCALLS_H
 #define PS2_SYSCALLS_H
 
-#include "ps2_runtime.h"
 #include "ps2_call_list.h"
-#include <mutex>
-#include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <string>
+
+struct R5900Context;
+class PS2Runtime;
 
 std::string translatePs2Path(const char *ps2Path);
 
@@ -32,4 +31,3 @@ namespace ps2_syscalls
 }
 
 #endif // PS2_SYSCALLS_H
-

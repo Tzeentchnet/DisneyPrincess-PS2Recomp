@@ -608,6 +608,11 @@ void register_ps2_runtime_expansion_tests()
             registerGenericCallback(2u, 0xDEAD0002u);
             registerStreamCallback(0u, kVideoUserData);
             registerStreamCallback(2u, kAudioUserData);
+            {
+                // Players may initialise libmpeg after registering; the callbacks belong to the handle.
+                R5900Context initCtx{};
+                ps2_stubs::sceMpegInit(rdram.data(), &initCtx, &runtime);
+            }
 
             const std::vector<uint8_t> videoPayload = {
                 0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};

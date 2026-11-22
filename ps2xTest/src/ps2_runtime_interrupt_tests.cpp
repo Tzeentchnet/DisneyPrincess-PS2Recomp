@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_memory.h"
 
 #include <atomic>
 #include <chrono>
