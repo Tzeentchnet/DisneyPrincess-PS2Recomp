@@ -2,15 +2,12 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <vector>
 
 namespace ps2x::iop::detail
 {
-    // The part of the SPU2 that IOP sound drivers can observe: sample RAM,
-    // transfers, and each voice's cursor, ENDX bit and ENVX. Drivers stream by
-    // refilling behind NAX and free voices by polling ENVX and ENDX, so these
-    // have to advance even though nothing is mixed here.
     class IopSpu2
     {
     public:
@@ -35,33 +32,85 @@ namespace ps2x::iop::detail
         // A DMA block into sample RAM at the core's transfer address.
         void dmaWrite(uint32_t core, std::span<const uint8_t> bytes);
         void completeDma(uint32_t core);
+        void advance();
+        [[nodiscard]] std::vector<int16_t> takeAudio(size_t minimumFrames = 0u);
+        bool takeAudio(std::vector<int16_t> &destination, size_t minimumFrames);
 
     private:
         static constexpr uint32_t kCores = 2u;
         static constexpr uint32_t kVoices = 24u;
+        static constexpr uint32_t kDecodedSamples = 56u;
+
+        enum class EnvelopePhase : uint8_t
+        {
+            Off,
+            Attack,
+            Decay,
+            Sustain,
+            Release,
+        };
+
+        struct Envelope
+        {
+            uint32_t counter = 0u;
+            int32_t level = 0;
+        };
 
         struct Voice
         {
-            uint32_t block = 0;        // word address of the ADPCM block being played
-            uint32_t phase = 0;        // position in that block, in 1/4096 samples
-            uint64_t sample = 0;       // output sample this state is current at
+            std::array<int16_t, kDecodedSamples> decoded{};
+            std::array<uint32_t, 2> blocks{};
+            std::array<uint8_t, 2> flags{};
+            std::array<Envelope, 2> volumeEnvelopes{};
+            Envelope envelope{};
+            int32_t history1 = 0;
+            int32_t history2 = 0;
+            uint32_t decodeAddress = 0;
+            uint32_t phase = 0;
+            EnvelopePhase envelopePhase = EnvelopePhase::Off;
             bool playing = false;
-            bool explicitLoop = false; // LSAX written since key on
+            bool explicitLoop = false;
+        };
+
+        struct StereoFrame
+        {
+            int16_t left = 0;
+            int16_t right = 0;
         };
 
         [[nodiscard]] uint64_t sampleNow() const noexcept;
         [[nodiscard]] uint16_t &reg(uint32_t core, uint32_t offset);
         [[nodiscard]] uint32_t address(uint32_t core, uint32_t offset);
         void setAddress(uint32_t core, uint32_t offset, uint32_t value);
-        void enterBlock(uint32_t core, uint32_t index);
-        void advance(uint32_t core, uint32_t index);
-        void advanceCore(uint32_t core);
+        void decodeBlock(uint32_t core, uint32_t index, uint32_t slot);
+        void stepEnvelope(Envelope &envelope, uint32_t rate, bool decrease, bool exponential);
+        void updateEnvelope(uint32_t core, uint32_t index);
+        [[nodiscard]] int32_t voiceVolume(uint16_t value, Envelope &envelope);
+        [[nodiscard]] int32_t renderVoice(uint32_t core, uint32_t index);
+        [[nodiscard]] StereoFrame renderAutoDma(uint32_t core);
+        [[nodiscard]] StereoFrame renderSample();
+        void updateNextAddress(uint32_t core, uint32_t index);
         void keyOn(uint32_t core, uint32_t index);
         void keyOff(uint32_t core, uint32_t index);
+        void writeAutoDma(uint32_t core, std::span<const uint8_t> bytes);
+        void traceRenderedSample();
 
         std::vector<uint8_t> m_ram;
         std::array<uint16_t, Size / 2u> m_regs{};
         std::array<std::array<Voice, kVoices>, kCores> m_voices{};
+        std::array<std::deque<StereoFrame>, kCores> m_autoDma{};
+        std::array<std::array<uint16_t, 2>, kCores> m_masterVolume{};
+        std::array<std::array<uint16_t, 2>, kCores> m_inputVolume{};
+        std::vector<int16_t> m_audio;
+        uint64_t m_renderedSample = 0u;
+        bool m_audioStarted = false;
+        bool m_trace = false;
+        uint64_t m_traceFrames = 0u;
+        std::array<uint64_t, kCores> m_autoDmaUnderflowFrames{};
+        std::array<uint64_t, kCores> m_autoDmaUnderflowRuns{};
+        std::array<size_t, kCores> m_autoDmaMinimumDepth{};
+        std::array<size_t, kCores> m_autoDmaMaximumDepth{};
+        std::array<bool, kCores> m_autoDmaUnderflowActive{};
         const uint64_t *m_clock = nullptr;
     };
 }

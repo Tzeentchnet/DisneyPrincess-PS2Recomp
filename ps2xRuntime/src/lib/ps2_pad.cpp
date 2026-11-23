@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 namespace
 {
@@ -27,29 +28,38 @@ namespace
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
 
+    struct ScriptedInputState
+    {
+        unsigned pressed = 0u;
+        unsigned axes[4] = {
+            kPadStickCenter,
+            kPadStickCenter,
+            kPadStickCenter,
+            kPadStickCenter,
+        };
+    };
+
     // One line: "<pressed mask in hex> [lx ly rx ry]". An unreadable file,
     // for example one being rewritten, keeps the previous input.
-    void readScriptedInput(const char *path, uint8_t *data)
+    void readScriptedInput(const char *path, ScriptedInputState &state, uint8_t *data)
     {
-        thread_local unsigned pressed = 0u;
-        thread_local unsigned axes[4] = {kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
         if (std::FILE *file = std::fopen(path, "r"))
         {
             unsigned buttons = 0u;
             unsigned next[4] = {kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
             if (std::fscanf(file, "%x %u %u %u %u", &buttons, &next[0], &next[1], &next[2], &next[3]) >= 1)
             {
-                pressed = buttons;
-                std::copy(next, next + 4, axes);
+                state.pressed = buttons;
+                std::copy(next, next + 4, state.axes);
             }
             std::fclose(file);
         }
-        data[2] = static_cast<uint8_t>(~pressed & 0xFFu);
-        data[3] = static_cast<uint8_t>((~pressed >> 8) & 0xFFu);
-        data[6] = static_cast<uint8_t>(axes[0]);
-        data[7] = static_cast<uint8_t>(axes[1]);
-        data[4] = static_cast<uint8_t>(axes[2]);
-        data[5] = static_cast<uint8_t>(axes[3]);
+        data[2] = static_cast<uint8_t>(~state.pressed & 0xFFu);
+        data[3] = static_cast<uint8_t>((~state.pressed >> 8) & 0xFFu);
+        data[6] = static_cast<uint8_t>(state.axes[0]);
+        data[7] = static_cast<uint8_t>(state.axes[1]);
+        data[4] = static_cast<uint8_t>(state.axes[2]);
+        data[5] = static_cast<uint8_t>(state.axes[3]);
     }
 }
 
@@ -70,13 +80,26 @@ bool PSPadBackend::readState(int port, int /*slot*/, uint8_t *data, size_t size)
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
 
-    // PS2X_INPUT_FILE replaces host input on the first port, for repeatable
+    // Scripted input replaces host input while configured, for repeatable
     // runs that do not depend on window focus.
-    static const char *const inputFile = std::getenv("PS2X_INPUT_FILE");
-    if (inputFile && *inputFile)
+    const char *const inputFiles[] = {
+        std::getenv("PS2X_INPUT_FILE"),
+        std::getenv("PS2X_INPUT_FILE_2"),
+    };
+    const bool scriptedInputEnabled =
+        (inputFiles[0] && *inputFiles[0]) ||
+        (inputFiles[1] && *inputFiles[1]);
+    if (scriptedInputEnabled)
     {
-        if (port == 0)
-            readScriptedInput(inputFile, data);
+        if (port >= 0 && port < static_cast<int>(std::size(inputFiles)))
+        {
+            const char *const inputFile = inputFiles[port];
+            if (inputFile && *inputFile)
+            {
+                thread_local ScriptedInputState inputStates[std::size(inputFiles)];
+                readScriptedInput(inputFile, inputStates[port], data);
+            }
+        }
         return true;
     }
 

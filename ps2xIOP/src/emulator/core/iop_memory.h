@@ -72,6 +72,15 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        void advanceSpu2() { m_spu2.advance(); }
+        [[nodiscard]] std::vector<int16_t> takeSpu2Audio(size_t minimumFrames)
+        {
+            return m_spu2.takeAudio(minimumFrames);
+        }
+        bool takeSpu2Audio(std::vector<int16_t> &destination, size_t minimumFrames)
+        {
+            return m_spu2.takeAudio(destination, minimumFrames);
+        }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 

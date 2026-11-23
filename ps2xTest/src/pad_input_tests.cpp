@@ -5,10 +5,15 @@
 #include "runtime/ps2_pad.h"
 #include "Stubs/Pad.h"
 
-#include <vector>
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
 #include <string>
-
+#include <vector>
 
 namespace
 {
@@ -64,6 +69,73 @@ namespace
         const uint8_t *data = rdram.data() + kPadDataAddr;
         return static_cast<uint16_t>(data[2] | (data[3] << 8));
     }
+
+    void setEnvironmentVariable(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        if (_putenv_s(name, value ? value : "") != 0)
+#else
+        const int result = value ? setenv(name, value, 1) : unsetenv(name);
+        if (result != 0)
+#endif
+        {
+            throw std::runtime_error(std::string("Failed to update environment variable ") + name);
+        }
+    }
+
+    class ScopedEnvironmentVariable
+    {
+    public:
+        ScopedEnvironmentVariable(const char *name, const char *value)
+            : m_name(name)
+        {
+            if (const char *previous = std::getenv(name))
+            {
+                m_hadPrevious = true;
+                m_previous = previous;
+            }
+            setEnvironmentVariable(name, value);
+        }
+
+        ~ScopedEnvironmentVariable()
+        {
+            setEnvironmentVariable(m_name.c_str(), m_hadPrevious ? m_previous.c_str() : nullptr);
+        }
+
+    private:
+        std::string m_name;
+        std::string m_previous;
+        bool m_hadPrevious = false;
+    };
+
+    class TemporaryInputFile
+    {
+    public:
+        TemporaryInputFile(const std::filesystem::path &path, const char *contents)
+            : m_path(path)
+        {
+            std::ofstream output(m_path);
+            if (!output)
+            {
+                throw std::runtime_error("Failed to create scripted pad input file");
+            }
+            output << contents;
+        }
+
+        ~TemporaryInputFile()
+        {
+            std::error_code error;
+            std::filesystem::remove(m_path, error);
+        }
+
+        const std::filesystem::path &path() const
+        {
+            return m_path;
+        }
+
+    private:
+        std::filesystem::path m_path;
+    };
 }
 
 void register_pad_input_tests()
@@ -154,6 +226,58 @@ void register_pad_input_tests()
             t.Equals(PSPadBackend::mergeActiveLowButtons(gamepadButtons, keyboardButtons),
                      expected,
                      "keyboard buttons should remain visible while a gamepad is connected");
+        });
+
+        tc.Run("scripted pad files drive ports independently", [](TestCase &t)
+               {
+            const std::string token = std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempDirectory =
+                std::filesystem::temp_directory_path();
+            const TemporaryInputFile port0File(
+                tempDirectory / ("ps2x_pad_port0_" + token + ".txt"),
+                "4008 1 2 3 4\n");
+            const TemporaryInputFile port1File(
+                tempDirectory / ("ps2x_pad_port1_" + token + ".txt"),
+                "2080 11 12 13 14\n");
+            const std::string port0Path = port0File.path().string();
+            const std::string port1Path = port1File.path().string();
+            const ScopedEnvironmentVariable port0Environment(
+                "PS2X_INPUT_FILE", port0Path.c_str());
+            const ScopedEnvironmentVariable port1Environment(
+                "PS2X_INPUT_FILE_2", port1Path.c_str());
+
+            PSPadBackend backend;
+            std::array<uint8_t, 32> port0{};
+            std::array<uint8_t, 32> port1{};
+            t.IsTrue(backend.readState(0, 0, port0.data(), port0.size()),
+                     "port 0 scripted input should be readable");
+            t.IsTrue(backend.readState(1, 0, port1.data(), port1.size()),
+                     "port 1 scripted input should be readable");
+
+            t.Equals(static_cast<uint16_t>(port0[2] | (port0[3] << 8)),
+                     static_cast<uint16_t>(~0x4008u),
+                     "port 0 should use only PS2X_INPUT_FILE");
+            t.Equals(port0[6], static_cast<uint8_t>(1), "port 0 lx should match its file");
+            t.Equals(port0[7], static_cast<uint8_t>(2), "port 0 ly should match its file");
+            t.Equals(port0[4], static_cast<uint8_t>(3), "port 0 rx should match its file");
+            t.Equals(port0[5], static_cast<uint8_t>(4), "port 0 ry should match its file");
+
+            t.Equals(static_cast<uint16_t>(port1[2] | (port1[3] << 8)),
+                     static_cast<uint16_t>(~0x2080u),
+                     "port 1 should use only PS2X_INPUT_FILE_2");
+            t.Equals(port1[6], static_cast<uint8_t>(11), "port 1 lx should match its file");
+            t.Equals(port1[7], static_cast<uint8_t>(12), "port 1 ly should match its file");
+            t.Equals(port1[4], static_cast<uint8_t>(13), "port 1 rx should match its file");
+            t.Equals(port1[5], static_cast<uint8_t>(14), "port 1 ry should match its file");
+
+            setEnvironmentVariable("PS2X_INPUT_FILE", nullptr);
+            std::array<uint8_t, 32> neutralPort0{};
+            t.IsTrue(backend.readState(0, 0, neutralPort0.data(), neutralPort0.size()),
+                     "an unspecified scripted port should still return a connected pad");
+            t.Equals(static_cast<uint16_t>(neutralPort0[2] | (neutralPort0[3] << 8)),
+                     static_cast<uint16_t>(0xFFFFu),
+                     "an unspecified port should stay neutral while the other port is scripted");
         });
 
         tc.Run("auto Start pulses are counted in guest pad reads", [](TestCase &t)

@@ -166,6 +166,53 @@ namespace
         }
     }
 
+    void testGuestBranchCheckpointHandler(uint8_t *,
+                                          R5900Context *ctx,
+                                          PS2Runtime *runtime)
+    {
+        if (ctx && runtime)
+        {
+            setRegU32(*ctx, 2, 0x00C0FFEEu);
+            runtime->postEeEvent(
+                EeEvent{EeEventType::ExternalWake, 0u, 0u});
+            (void)runtime->eeCheckpointDue();
+        }
+    }
+
+    std::atomic<bool> gNestedCheckpointTargetExecuted{false};
+    std::atomic<bool> gNestedCheckpointContinued{false};
+
+    void testGuestBranchNestedCheckpointTarget(uint8_t *,
+                                               R5900Context *,
+                                               PS2Runtime *)
+    {
+        gNestedCheckpointTargetExecuted.store(true,
+                                              std::memory_order_relaxed);
+    }
+
+    void testGuestBranchNestedCheckpointHandler(uint8_t *,
+                                                R5900Context *ctx,
+                                                PS2Runtime *runtime)
+    {
+        if (!ctx || !runtime)
+        {
+            return;
+        }
+
+        runtime->postEeEvent(
+            EeEvent{EeEventType::ExternalWake, 0u, 0u});
+        const bool continued = runtime->dispatchGuestBranch(
+            nullptr,
+            ctx,
+            0x4000u,
+            0x3154u,
+            0x3158u,
+            PS2Runtime::GuestBranchKind::DirectCall,
+            "test-nested-checkpoint");
+        gNestedCheckpointContinued.store(continued,
+                                         std::memory_order_relaxed);
+    }
+
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
 
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
@@ -453,6 +500,70 @@ void register_ps2_runtime_expansion_tests()
                       "call-like dispatch should stop caller flow when callee transfers elsewhere");
             t.Equals(ctx.pc, 0x33330000u,
                      "callee transfer PC should be preserved");
+        });
+
+        tc.Run("dispatchGuestBranch preserves an entry-PC checkpoint", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3150u, &testGuestBranchCheckpointHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3150u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "test-jalr-checkpoint");
+
+            t.IsFalse(returnedToFallthrough,
+                      "checkpoint unwind must stop the generated caller");
+            t.Equals(ctx.pc, 0x3150u,
+                     "checkpoint at the callee entry must remain resumable");
+            t.Equals(::getRegU32(&ctx, 2), 0x00C0FFEEu,
+                     "callee work before the checkpoint should be preserved");
+        });
+
+        tc.Run("dispatchGuestBranch propagates a nested dispatch checkpoint", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(
+                0x3150u,
+                &testGuestBranchNestedCheckpointHandler);
+            runtime.registerFunction(
+                0x4000u,
+                &testGuestBranchNestedCheckpointTarget);
+            gNestedCheckpointTargetExecuted.store(false,
+                                                  std::memory_order_relaxed);
+            gNestedCheckpointContinued.store(false,
+                                             std::memory_order_relaxed);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToAncestorFallthrough =
+                runtime.dispatchGuestBranch(
+                    nullptr,
+                    &ctx,
+                    0x3150u,
+                    0x2000u,
+                    0x4000u,
+                    PS2Runtime::GuestBranchKind::DirectCall,
+                    "test-ancestor-checkpoint");
+
+            t.IsFalse(returnedToAncestorFallthrough,
+                      "nested checkpoint must unwind every generated caller");
+            t.IsFalse(gNestedCheckpointContinued.load(
+                          std::memory_order_relaxed),
+                      "checkpointed nested target must not resume its caller");
+            t.IsFalse(gNestedCheckpointTargetExecuted.load(
+                          std::memory_order_relaxed),
+                      "checkpointed target must remain pending for the dispatcher");
+            t.Equals(ctx.pc, 0x4000u,
+                     "nested checkpoint target must remain resumable");
         });
 
         tc.Run("dispatchGuestBranch rejects missing exact targets", [](TestCase &t)

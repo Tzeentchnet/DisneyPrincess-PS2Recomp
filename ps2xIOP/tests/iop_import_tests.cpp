@@ -10,6 +10,7 @@
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <cstring>
@@ -339,7 +340,93 @@ namespace
             return false;
 
         memory.write16(spu + 0x1A4u, 1u); // key off
-        return expect(memory.read16(spu + 0x00Au) == 0u, "key off should release the voice");
+        if (!expect(memory.read16(spu + 0x00Au) != 0u,
+                    "ADSR release should not stop the voice immediately"))
+            return false;
+        cycles += 4u * IopSpu2::IopCyclesPerSample;
+        return expect(memory.read16(spu + 0x00Au) == 0u,
+                      "ADSR release did not finish");
+    }
+
+    bool testSpu2AdpcmMixing()
+    {
+        IopSpu2 spu2;
+        uint64_t cycles = 0u;
+        spu2.setClock(&cycles);
+        constexpr uint32_t spu = IopSpu2::Base;
+
+        spu2.write16(spu + 0x1A8u, 0u);
+        spu2.write16(spu + 0x1AAu, 0x200u);
+        spu2.write16(spu + 0x1ACu, 0x0100u);
+        for (uint32_t word = 0u; word < 7u; ++word)
+            spu2.write16(spu + 0x1ACu, 0x1111u);
+
+        spu2.write16(spu + 0x000u, 0x3FFFu);
+        spu2.write16(spu + 0x002u, 0x3FFFu);
+        spu2.write16(spu + 0x004u, 0x1000u);
+        spu2.write16(spu + 0x006u, 0x000Fu);
+        spu2.write16(spu + 0x1C0u, 0u);
+        spu2.write16(spu + 0x1C2u, 0x200u);
+        spu2.write16(spu + 0x1A0u, 1u);
+
+        cycles = 32u * IopSpu2::IopCyclesPerSample;
+        spu2.advance();
+        const std::vector<int16_t> audio = spu2.takeAudio();
+        if (!expect(audio.size() == 64u, "SPU2 did not render 32 stereo frames"))
+            return false;
+
+        const bool audible = std::any_of(audio.begin(), audio.end(), [](int16_t sample)
+        {
+            return sample != 0;
+        });
+        if (!expect(audible, "SPU2 ADPCM voice rendered only silence"))
+            return false;
+        for (size_t frame = 0u; frame < audio.size() / 2u; ++frame)
+        {
+            if (!expect(audio[frame * 2u] == audio[frame * 2u + 1u],
+                        "equal voice volumes produced unequal stereo output"))
+                return false;
+        }
+        return expect((spu2.read16(spu + 0x340u) & 1u) != 0u,
+                      "non-repeating ADPCM end did not set ENDX");
+    }
+
+    bool testSpu2AutoDmaMixing()
+    {
+        IopSpu2 spu2;
+        uint64_t cycles = 0u;
+        spu2.setClock(&cycles);
+        constexpr uint32_t spu = IopSpu2::Base;
+
+        std::vector<uint8_t> block(1024u);
+        for (size_t frame = 0u; frame < 256u; ++frame)
+        {
+            const int16_t left = 1000;
+            const int16_t right = -1000;
+            std::memcpy(block.data() + frame * sizeof(int16_t),
+                        &left,
+                        sizeof(left));
+            std::memcpy(block.data() + 512u + frame * sizeof(int16_t),
+                        &right,
+                        sizeof(right));
+        }
+
+        spu2.write16(spu + 0x1B0u, 1u);
+        spu2.dmaWrite(0u, block);
+        cycles = 4u * IopSpu2::IopCyclesPerSample;
+        spu2.advance();
+        const std::vector<int16_t> audio = spu2.takeAudio();
+        if (!expect(audio.size() == 8u, "AutoDMA did not render four stereo frames"))
+            return false;
+        for (size_t frame = 0u; frame < audio.size() / 2u; ++frame)
+        {
+            if (!expect(audio[frame * 2u] > 900,
+                        "AutoDMA left channel was not mixed") ||
+                !expect(audio[frame * 2u + 1u] < -900,
+                        "AutoDMA right channel was not mixed"))
+                return false;
+        }
+        return true;
     }
 
     bool testTimrmanPeriodicCallback()
@@ -458,6 +545,7 @@ int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
         !testTimrmanPeriodicCallback() || !testVblankHandler() || !testSpu2VoiceCursor() ||
+        !testSpu2AdpcmMixing() || !testSpu2AutoDmaMixing() ||
         !testStdioPrintfFormatting() ||
         !testDetachedSemaphoreWaitFailsExplicitly())
         return 1;

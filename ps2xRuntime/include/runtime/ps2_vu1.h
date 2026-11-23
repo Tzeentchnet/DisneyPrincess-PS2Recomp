@@ -141,35 +141,43 @@ private:
 
     struct DecodedInstructionPair
     {
+        static constexpr uint8_t UpperVfShadowMask = 0x1Fu;
+        static constexpr uint8_t Plain = 1u << 7;
+
+        static constexpr uint8_t LowerFdiv = 1u << 0;
+        static constexpr uint8_t LowerEfu = 1u << 1;
+        static constexpr uint8_t LowerWaitQ = 1u << 2;
+        static constexpr uint8_t LowerWaitP = 1u << 3;
+        static constexpr uint8_t LowerXgkick = 1u << 4;
+        static constexpr uint8_t LowerBranch = 1u << 5;
+        static constexpr uint8_t DelaysNextBranchRead = 1u << 6;
+        static constexpr uint8_t ResourceWaitMask =
+            LowerFdiv | LowerEfu | LowerWaitQ | LowerWaitP | LowerXgkick;
+
         uint32_t lower = 0;
         uint32_t upper = 0;
-        UpperInstruction upperOp{};
-        LowerInstruction lowerOp{};
-        // No I bit, VF shadowing or reserved encoding.
-        bool plain = false;
-        // E, D or T bit.
-        bool mayEnd = false;
-        bool readsFlags = false;
-        bool hasResourceWait = false;
-        InstructionUsage lowerUsage{};
-        InstructionUsage upperUsage{};
-        bool iBit = false;
-        bool eBit = false;
-        bool mBit = false;
-        bool dBit = false;
-        bool tBit = false;
-        uint8_t upperVfShadowReg = 0;
-        uint8_t suppressedLowerVf = 0;
         // Precomputed from the usages for the interlock check. A VF lane is bit
         // reg * 4 + lane of a 128-bit set and a VI register is its own bit.
         std::array<uint64_t, 2> vfReads{};
         std::array<uint64_t, 2> vfWrites{};
+        UpperInstruction upperOp{};
+        LowerInstruction lowerOp{};
         uint16_t viReads = 0;
         uint16_t viWrites = 0;
         uint16_t viSlowWrites = 0; // the ones that take kFmacLatency
+        uint8_t executionInfo = 0;
         uint8_t firstViWrite = 0;
         uint8_t maxWriteLatency = 0;
+        uint8_t lowerInfo = 0;
+
+        uint8_t upperVfShadowReg() const
+        {
+            return static_cast<uint8_t>(executionInfo & UpperVfShadowMask);
+        }
+        bool isPlain() const { return (executionInfo & Plain) != 0u; }
+        bool lowerHas(uint8_t flags) const { return (lowerInfo & flags) != 0u; }
     };
+    static_assert(sizeof(DecodedInstructionPair) == 64u);
 
     struct FlagPipelineEntry
     {
@@ -230,11 +238,13 @@ private:
     // pairs after it. So the last three pairs' slow writes are the scoreboard.
     struct IssuedWrites
     {
-        std::array<uint64_t, 2> vf{};
-        uint64_t readyCycle = 0;
-        uint32_t vi = 0;
+        std::array<std::array<uint64_t, 2>, 3> vf{};
+        std::array<uint64_t, 3> readyCycle{};
+        std::array<uint32_t, 3> vi{};
     };
-    std::array<IssuedWrites, 3> m_issued{}; // newest first
+    IssuedWrites m_issued{}; // newest first
+    std::array<uint64_t, 2> m_issuedVfAggregate{};
+    uint32_t m_issuedViAggregate = 0;
 
     uint64_t m_cycle = 0;
     uint64_t m_efuResourceReady = 0;

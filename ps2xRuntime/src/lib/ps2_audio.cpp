@@ -1,7 +1,15 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
+#include <limits>
 #include <vector>
 
 namespace
@@ -71,12 +79,45 @@ namespace ps2_vag
 
 struct PS2AudioBackend::Impl
 {
+    static constexpr size_t StreamFrames = 8192u;
+    static constexpr size_t MaxQueuedFrames = 48000u;
+
     struct TrackedSound
     {
         Sound snd;
         uint32_t sampleKey;
     };
+
     std::vector<TrackedSound> activeSounds;
+#if !defined(PLATFORM_VITA)
+    AudioStream stream{};
+    bool streamReady = false;
+    bool streamPlaying = false;
+    size_t primedBuffers = 0u;
+#endif
+    std::vector<int16_t> queuedAudio;
+    size_t queuedAudioRead = 0u;
+    bool reportedOverflow = false;
+    bool reportedStreamFailure = false;
+    bool trace = []
+    {
+        const char *value = std::getenv("PS2X_TRACE_AUDIO");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    uint64_t tracedFrames = 0u;
+    int32_t tracedPeak = 0;
+    size_t tracedMinimumQueuedFrames = std::numeric_limits<size_t>::max();
+    size_t tracedMaximumQueuedFrames = 0u;
+    uint64_t tracedRefillShortages = 0u;
+    bool refillShortageActive = false;
+    std::atomic<uint64_t> hleCommands{0u};
+    std::atomic<uint64_t> hlePlays{0u};
+    std::chrono::steady_clock::time_point lastSubmission{};
+    uint64_t tracedMaximumSubmissionGapMicros = 0u;
+    uint64_t tracedSubmissions = 0u;
+    std::chrono::steady_clock::time_point lastDeviceUpdate{};
+    uint64_t tracedMaximumDeviceUpdateGapMicros = 0u;
+    uint64_t tracedDeviceUpdates = 0u;
 };
 
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
@@ -87,6 +128,220 @@ PS2AudioBackend::~PS2AudioBackend()
 {
     if (m_impl)
         stopAll();
+}
+
+void PS2AudioBackend::setAudioReady(bool ready)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_audioReady = ready;
+    if (ready)
+        return;
+
+#if !defined(PLATFORM_VITA)
+    if (m_impl->streamReady)
+    {
+        if (m_impl->streamPlaying)
+            StopAudioStream(m_impl->stream);
+        UnloadAudioStream(m_impl->stream);
+        m_impl->stream = {};
+        m_impl->streamReady = false;
+        m_impl->streamPlaying = false;
+        m_impl->primedBuffers = 0u;
+    }
+#endif
+    m_impl->queuedAudio.clear();
+    m_impl->queuedAudioRead = 0u;
+    m_impl->lastSubmission = {};
+    m_impl->lastDeviceUpdate = {};
+}
+
+void PS2AudioBackend::submitFrames(std::span<const int16_t> interleavedStereo)
+{
+    if ((interleavedStereo.size() & 1u) != 0u)
+    {
+        std::cerr << "[ps2xRuntime][audio] rejected an odd interleaved sample count\n";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_audioReady || interleavedStereo.empty())
+        return;
+
+    if (m_impl->trace)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (m_impl->lastSubmission.time_since_epoch().count() != 0)
+        {
+            const uint64_t gapMicros = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - m_impl->lastSubmission)
+                    .count());
+            m_impl->tracedMaximumSubmissionGapMicros =
+                std::max(m_impl->tracedMaximumSubmissionGapMicros, gapMicros);
+        }
+        m_impl->lastSubmission = now;
+        ++m_impl->tracedSubmissions;
+
+        for (const int16_t sample : interleavedStereo)
+        {
+            const int32_t magnitude =
+                sample == std::numeric_limits<int16_t>::min()
+                    ? 32768
+                    : std::abs(static_cast<int32_t>(sample));
+            m_impl->tracedPeak = std::max(m_impl->tracedPeak, magnitude);
+        }
+        m_impl->tracedFrames += interleavedStereo.size() / 2u;
+        if (m_impl->tracedFrames >= 48000u)
+        {
+            const size_t minimumQueuedFrames =
+                m_impl->tracedMinimumQueuedFrames == std::numeric_limits<size_t>::max()
+                    ? 0u
+                    : m_impl->tracedMinimumQueuedFrames;
+            const uint64_t hleCommands =
+                m_impl->hleCommands.exchange(0u, std::memory_order_relaxed);
+            const uint64_t hlePlays =
+                m_impl->hlePlays.exchange(0u, std::memory_order_relaxed);
+            std::fprintf(
+                stderr,
+                "[ps2xRuntime][audio] mixed_frames=%llu peak=%d "
+                "queued_frames_min=%zu queued_frames_max=%zu "
+                "refill_shortages=%llu submissions=%llu "
+                "max_submit_gap_ms=%.3f device_updates=%llu "
+                "max_device_update_gap_ms=%.3f device_buffer_frames=%zu "
+                "hle_commands=%llu hle_plays=%llu\n",
+                static_cast<unsigned long long>(m_impl->tracedFrames),
+                m_impl->tracedPeak,
+                minimumQueuedFrames,
+                m_impl->tracedMaximumQueuedFrames,
+                static_cast<unsigned long long>(m_impl->tracedRefillShortages),
+                static_cast<unsigned long long>(m_impl->tracedSubmissions),
+                m_impl->tracedMaximumSubmissionGapMicros / 1000.0,
+                static_cast<unsigned long long>(m_impl->tracedDeviceUpdates),
+                m_impl->tracedMaximumDeviceUpdateGapMicros / 1000.0,
+                Impl::StreamFrames * 2u,
+                static_cast<unsigned long long>(hleCommands),
+                static_cast<unsigned long long>(hlePlays));
+            m_impl->tracedFrames %= 48000u;
+            m_impl->tracedPeak = 0;
+            m_impl->tracedMinimumQueuedFrames =
+                std::numeric_limits<size_t>::max();
+            m_impl->tracedMaximumQueuedFrames = 0u;
+            m_impl->tracedRefillShortages = 0u;
+            m_impl->tracedMaximumSubmissionGapMicros = 0u;
+            m_impl->tracedSubmissions = 0u;
+            m_impl->tracedMaximumDeviceUpdateGapMicros = 0u;
+            m_impl->tracedDeviceUpdates = 0u;
+        }
+    }
+
+#if defined(PLATFORM_VITA)
+    return;
+#else
+    if (!m_impl->streamReady)
+    {
+        SetAudioStreamBufferSizeDefault(static_cast<int>(Impl::StreamFrames));
+        m_impl->stream = LoadAudioStream(48000u, 16u, 2u);
+        m_impl->streamReady = IsAudioStreamValid(m_impl->stream);
+        if (!m_impl->streamReady)
+        {
+            if (!m_impl->reportedStreamFailure)
+            {
+                std::cerr << "[ps2xRuntime][audio] failed to create the 48 kHz output stream\n";
+                m_impl->reportedStreamFailure = true;
+            }
+            return;
+        }
+        m_impl->queuedAudio.reserve(Impl::StreamFrames * 8u);
+    }
+
+    m_impl->queuedAudio.insert(m_impl->queuedAudio.end(),
+                               interleavedStereo.begin(),
+                               interleavedStereo.end());
+    size_t availableSamples = m_impl->queuedAudio.size() - m_impl->queuedAudioRead;
+    const size_t maximumSamples = Impl::MaxQueuedFrames * 2u;
+    if (availableSamples > maximumSamples)
+    {
+        const size_t droppedSamples = (availableSamples - maximumSamples) & ~size_t{1u};
+        m_impl->queuedAudioRead += droppedSamples;
+        availableSamples -= droppedSamples;
+        if (!m_impl->reportedOverflow)
+        {
+            std::cerr << "[ps2xRuntime][audio] output fell behind; dropping queued frames\n";
+            m_impl->reportedOverflow = true;
+        }
+    }
+
+    std::array<int16_t, Impl::StreamFrames * 2u> block{};
+    while (availableSamples >= block.size() &&
+           IsAudioStreamProcessed(m_impl->stream))
+    {
+        std::copy_n(m_impl->queuedAudio.begin() +
+                        static_cast<std::ptrdiff_t>(m_impl->queuedAudioRead),
+                    block.size(),
+                    block.begin());
+        UpdateAudioStream(m_impl->stream,
+                          block.data(),
+                          static_cast<int>(Impl::StreamFrames));
+        if (m_impl->trace)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (m_impl->lastDeviceUpdate.time_since_epoch().count() != 0)
+            {
+                const uint64_t gapMicros = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - m_impl->lastDeviceUpdate)
+                        .count());
+                m_impl->tracedMaximumDeviceUpdateGapMicros =
+                    std::max(m_impl->tracedMaximumDeviceUpdateGapMicros, gapMicros);
+            }
+            m_impl->lastDeviceUpdate = now;
+            ++m_impl->tracedDeviceUpdates;
+        }
+        m_impl->queuedAudioRead += block.size();
+        availableSamples -= block.size();
+        if (!m_impl->streamPlaying)
+        {
+            ++m_impl->primedBuffers;
+            if (m_impl->primedBuffers >= 2u)
+            {
+                PlayAudioStream(m_impl->stream);
+                m_impl->streamPlaying = true;
+            }
+        }
+    }
+
+    if (m_impl->queuedAudioRead == m_impl->queuedAudio.size())
+    {
+        m_impl->queuedAudio.clear();
+        m_impl->queuedAudioRead = 0u;
+    }
+    else if (m_impl->queuedAudioRead >= Impl::StreamFrames * 8u)
+    {
+        m_impl->queuedAudio.erase(
+            m_impl->queuedAudio.begin(),
+            m_impl->queuedAudio.begin() +
+                static_cast<std::ptrdiff_t>(m_impl->queuedAudioRead));
+        m_impl->queuedAudioRead = 0u;
+    }
+
+    if (m_impl->trace)
+    {
+        const size_t queuedFrames = availableSamples / 2u;
+        m_impl->tracedMinimumQueuedFrames =
+            std::min(m_impl->tracedMinimumQueuedFrames, queuedFrames);
+        m_impl->tracedMaximumQueuedFrames =
+            std::max(m_impl->tracedMaximumQueuedFrames, queuedFrames);
+        const bool refillShortage =
+            m_impl->streamPlaying &&
+            IsAudioStreamProcessed(m_impl->stream) &&
+            availableSamples < block.size();
+        if (refillShortage && !m_impl->refillShortageActive)
+        {
+            ++m_impl->tracedRefillShortages;
+        }
+        m_impl->refillShortageActive = refillShortage;
+    }
+#endif
 }
 
 void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)
@@ -153,6 +408,7 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
     if ((rpcNum == LIBSD_CMD_SET_VOICE || (rpcNum & 0xFF00u) == 0x8100u) &&
         sendBuf && sendSize >= 20)
     {
+        m_impl->hleCommands.fetch_add(1u, std::memory_order_relaxed);
         uint32_t sampleAddr = 0;
         uint32_t voiceIndex = 0xFFFFFFFFu;
         for (int vo = 4; vo >= 0 && voiceIndex == 0xFFFFFFFFu; vo -= 4)
@@ -304,6 +560,7 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
     SetSoundVolume(snd, volume);
     m_impl->activeSounds.push_back({snd, sampleKey});
     PlaySound(snd);
+    m_impl->hlePlays.fetch_add(1u, std::memory_order_relaxed);
 #endif
 }
 
@@ -316,6 +573,8 @@ void PS2AudioBackend::stopAll()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 #if defined(PLATFORM_VITA)
+    m_impl->queuedAudio.clear();
+    m_impl->queuedAudioRead = 0u;
     return;
 #else
     for (auto &t : m_impl->activeSounds)
@@ -324,5 +583,17 @@ void PS2AudioBackend::stopAll()
         UnloadSound(t.snd);
     }
     m_impl->activeSounds.clear();
+    if (m_impl->streamReady)
+    {
+        if (m_impl->streamPlaying)
+            StopAudioStream(m_impl->stream);
+        UnloadAudioStream(m_impl->stream);
+        m_impl->stream = {};
+        m_impl->streamReady = false;
+        m_impl->streamPlaying = false;
+        m_impl->primedBuffers = 0u;
+    }
+    m_impl->queuedAudio.clear();
+    m_impl->queuedAudioRead = 0u;
 #endif
 }

@@ -277,6 +277,38 @@ namespace
                 check(gpu->GetNativeImage() != nullptr, "repeated Vulkan frame lost its image");
             }
         }
+        priv.pmode = 1 | (1ull << 5) | (0xffull << 8);
+        priv.smode1 = (32ull << 3) | (2ull << 13);
+        priv.smode2 = 1;
+        priv.dispfb1 = 10ull << 9;
+        priv.display1 = 318 | (50ull << 12) | (1ull << 23) |
+                        (1279ull << 32) | (447ull << 44);
+        std::vector<uint8_t> fieldPixels[2];
+        uint32_t fieldWidth = 0;
+        uint32_t fieldHeight = 0;
+        for (uint32_t field = 0; field < 2; ++field)
+        {
+            priv.csr = uint64_t(field) << 13;
+            ++priv.vsyncTick;
+            gs.latchHostPresentationFrame();
+            uint32_t width = 0, height = 0;
+            float aspect = 0;
+            const auto gpu = gs.getLatchedGpuFrame(width, height, aspect);
+            check(gpu && gpu->Readback(fieldPixels[field]),
+                  "interlaced field readback failed");
+            if (field == 0)
+            {
+                fieldWidth = width;
+                fieldHeight = height;
+            }
+            else
+            {
+                check(width == fieldWidth && height == fieldHeight,
+                      "interlaced fields changed scanout dimensions");
+            }
+        }
+        check(fieldPixels[0] == fieldPixels[1],
+              "alternate field phases produced vertical presentation jitter");
         check(gs.getReadbackCount() == before, "presentation requested VRAM readback");
         std::cout << "Progressive/interlaced Vulkan scanout and repeated frames passed\n";
     }

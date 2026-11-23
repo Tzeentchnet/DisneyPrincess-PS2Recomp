@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -18,12 +19,13 @@ public:
     void onSoundCommand(uint32_t sid, uint32_t rpcNum,
                         const uint8_t *sendBuf, uint32_t sendSize,
                         uint8_t *recvBuf, uint32_t recvSize);
+    void submitFrames(std::span<const int16_t> interleavedStereo);
 
     void play(uint32_t sampleAddr, float pitch = 1.0f, float volume = 1.0f,
               uint32_t voiceIndex = 0xFFFFFFFFu);
     void stop(uint32_t voiceId);
     void stopAll();
-    void setAudioReady(bool ready) { m_audioReady = ready; }
+    void setAudioReady(bool ready);
 
 private:
     struct DecodedSample

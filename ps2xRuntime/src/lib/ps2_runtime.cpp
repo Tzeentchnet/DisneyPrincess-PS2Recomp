@@ -641,15 +641,11 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         m_iopSubsystem.reset();
         m_iopHost.reset();
-#if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
-#else
+#if !defined(PLATFORM_VITA)
         if (IsAudioDeviceReady())
-        {
             CloseAudioDevice();
-            m_audioBackend.setAudioReady(false);
-        }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
         {
@@ -1536,7 +1532,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler &&
+        eeCheckpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
     }
@@ -1589,12 +1586,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
         return false;
     }
-
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t checkpointGeneration = m_guestCheckpointGeneration;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
+    {
+        return false;
+    }
+
+    if (m_guestCheckpointGeneration != checkpointGeneration)
     {
         return false;
     }
@@ -2414,7 +2416,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+    {
+        ++m_guestCheckpointGeneration;
+    }
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)

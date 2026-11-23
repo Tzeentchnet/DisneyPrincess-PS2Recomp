@@ -810,6 +810,7 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        std::vector<int16_t> audioDelivery;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
@@ -865,6 +866,23 @@ namespace ps2x::iop::detail
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
+        try
+        {
+            m_impl->memory.advanceSpu2();
+            if (m_impl->memory.takeSpu2Audio(m_impl->audioDelivery, 1024u))
+                m_impl->host.audioFrames(m_impl->audioDelivery);
+        }
+        catch (const std::exception &error)
+        {
+            std::fprintf(stderr,
+                         "[ps2xIOP][ERROR]: audio delivery exception: %s\n",
+                         error.what());
+        }
+        catch (...)
+        {
+            std::fprintf(stderr,
+                         "[ps2xIOP][ERROR]: audio delivery exception: unknown\n");
+        }
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

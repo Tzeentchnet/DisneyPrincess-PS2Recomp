@@ -557,6 +557,7 @@ private:
     size_t m_guestBranchDebugHistoryCursor = 0u;
     size_t m_guestBranchDebugHistoryCount = 0u;
     bool m_guestBranchDebugHistoryEnabled = false;
+    uint64_t m_guestCheckpointGeneration = 0u;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};

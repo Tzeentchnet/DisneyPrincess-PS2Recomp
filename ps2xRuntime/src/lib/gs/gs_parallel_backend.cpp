@@ -601,7 +601,12 @@ namespace
             info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             info.dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
-            info.crtc_offsets = true;
+            const bool alternateLineSampling =
+                (request.smode2 & 0x1u) != 0u &&
+                (request.smode2 & 0x2u) == 0u;
+            info.force_progressive = alternateLineSampling;
+            info.anti_blur = alternateLineSampling;
+            info.crtc_offsets = !alternateLineSampling;
             auto scanout = gs.vsync(info);
             ++presentIndex;
             if (!scanout.image)
